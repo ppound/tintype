@@ -1,4 +1,4 @@
-//! `tintype`: the command line. Every subcommand maps to one engine
+//! `tintype-cli`: the command line. Every subcommand maps to one engine
 //! [`Command`]; `tintype exec` reads commands as JSON lines from stdin.
 
 use std::io::{BufRead, IsTerminal, Write};
@@ -9,7 +9,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use tintype_engine::{Command, Engine, Event, PhotoRecord, PhotoRef, Response, ScanProgress, Sort};
 
 #[derive(Parser)]
-#[command(name = "tintype", version, about = "Index, search and tag your photos")]
+#[command(name = "tintype-cli", version, about = "Index, search and tag your photos")]
 struct Cli {
     /// Library folder (catalog + index). Defaults to the OS data folder.
     #[arg(long, global = true, env = "TINTYPE_LIBRARY")]
@@ -28,6 +28,11 @@ enum Cmd {
         #[arg(required = true)]
         folders: Vec<PathBuf>,
         /// Skip content hashing (faster on slow disks; no exact-duplicate detection).
+        #[arg(long)]
+        no_hash: bool,
+    },
+    /// Refresh every folder previously scanned.
+    Rescan {
         #[arg(long)]
         no_hash: bool,
     },
@@ -98,6 +103,7 @@ fn main() -> Result<()> {
 
     let cmd = match cli.cmd {
         Cmd::Scan { folders, no_hash } => Command::Scan { roots: folders, hash: !no_hash },
+        Cmd::Rescan { no_hash } => Command::Rescan { hash: !no_hash },
         Cmd::Search { query, sort, limit, offset } => {
             let sort = match sort {
                 SortArg::Relevance => Sort::Relevance,
@@ -219,6 +225,9 @@ fn print_response(response: &Response) {
             println!("library  {}", s.library);
             println!("photos   {}", s.photos);
             println!("indexed  {}", s.indexed);
+            for f in &s.folders {
+                println!("folder   {f}");
+            }
         }
     }
 }

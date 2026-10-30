@@ -48,6 +48,9 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE photos ADD COLUMN meta_version INTEGER NOT NULL DEFAULT 0;
 "#,
+    r#"
+    CREATE TABLE roots (path TEXT PRIMARY KEY);
+"#,
 ];
 
 /// A photo as produced by a scan, before it has an id.
@@ -238,6 +241,20 @@ impl Catalog {
         Ok(())
     }
 
+    /// Remembers folders the user added, so they can be rescanned together.
+    pub fn add_roots(&self, roots: &[String]) -> Result<()> {
+        for root in roots {
+            self.conn.execute("INSERT OR IGNORE INTO roots (path) VALUES (?1)", [root])?;
+        }
+        Ok(())
+    }
+
+    pub fn roots(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT path FROM roots ORDER BY path")?;
+        let roots = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        Ok(roots)
+    }
+
     fn tags(&self, id: i64) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare_cached("SELECT tag FROM photo_tags WHERE photo_id = ?1 ORDER BY tag")?;
         let tags = stmt.query_map([id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
@@ -340,6 +357,14 @@ mod tests {
         assert_eq!(cat.get(id).unwrap().unwrap().hash.as_deref(), Some("abc"));
         cat.upsert_many(&[NewPhoto { hash: None, size: 5, ..photo("/a.jpg", 1) }]).unwrap();
         assert_eq!(cat.get(id).unwrap().unwrap().hash, None);
+    }
+
+    #[test]
+    fn roots_are_remembered_once() {
+        let cat = Catalog::open_in_memory().unwrap();
+        cat.add_roots(&["/b".into(), "/a".into()]).unwrap();
+        cat.add_roots(&["/a".into()]).unwrap();
+        assert_eq!(cat.roots().unwrap(), vec!["/a", "/b"]);
     }
 
     #[test]

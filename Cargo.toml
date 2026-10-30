@@ -5,7 +5,7 @@ members = ["crates/*", "apps/*", "xtask"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.95"
 publish = false
 
 [workspace.dependencies]
@@ -20,17 +20,23 @@ tintype-faces = { path = "crates/faces" }
 tintype-jobs = { path = "crates/jobs" }
 tintype-engine = { path = "crates/engine" }
 tintype-testkit = { path = "crates/testkit" }
+tintype-ui-egui = { path = "crates/ui-egui" }
 
 # External.
 anyhow = "1"
 blake3 = "1.8"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+crossbeam-channel = "0.5"
 clap = { version = "4.6", features = ["derive", "env"] }
 directories = "6"
+eframe = { version = "0.37", features = ["persistence"] }
 dunce = "1"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "tiff"] }
 imagesize = "0.15"
+jpeg-decoder = { version = "0.3", default-features = false }
 kamadak-exif = "0.6"
 rayon = "1.12"
+rfd = "0.17"
 rusqlite = { version = "0.41", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

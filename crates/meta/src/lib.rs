@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
+use std::io::{BufReader, Cursor, Seek, SeekFrom};
 use std::path::Path;
 
 use chrono::{NaiveDate, NaiveDateTime};
@@ -70,25 +70,18 @@ pub struct PhotoMeta {
     pub fields: BTreeMap<String, String>,
 }
 
-/// Fujifilm RAF files start with this; their EXIF lives in an embedded JPEG.
-const RAF_MAGIC: &[u8] = b"FUJIFILMCCD-RAW ";
 /// EXIF must fit in one 64 KiB APP1 segment near the start of a JPEG.
 const RAF_JPEG_PREFIX: u32 = 256 * 1024;
 
 /// Reads metadata from a photo on disk.
 pub fn read_path(path: &Path) -> Result<PhotoMeta> {
     let mut file = File::open(path)?;
-    let mut head = [0u8; 92];
-    let head_len = read_up_to(&mut file, &mut head)?;
-    let raf = head_len == head.len() && head.starts_with(RAF_MAGIC);
-
-    let parsed = if raf {
-        // Header: big-endian offset and length of the embedded JPEG at bytes 84..92.
-        let offset = u32::from_be_bytes(head[84..88].try_into().expect("4 bytes"));
-        let len = u32::from_be_bytes(head[88..92].try_into().expect("4 bytes"));
+    let raf = tintype_codecs::raf_embedded_jpeg(&mut file)?;
+    let parsed = if let Some((offset, len)) = raf {
+        // A RAF's EXIF lives in its embedded JPEG.
         let mut jpeg = vec![0; len.min(RAF_JPEG_PREFIX) as usize];
-        file.seek(SeekFrom::Start(offset.into()))?;
-        let n = read_up_to(&mut file, &mut jpeg)?;
+        file.seek(SeekFrom::Start(offset))?;
+        let n = tintype_codecs::read_up_to(&mut file, &mut jpeg)?;
         jpeg.truncate(n);
         exif::Reader::new().read_from_container(&mut Cursor::new(jpeg))
     } else {
@@ -101,7 +94,7 @@ pub fn read_path(path: &Path) -> Result<PhotoMeta> {
         Err(e) => return Err(e.into()),
     };
     // The header is authoritative for dimensions; EXIF pixel dimensions are often stale after edits.
-    if raf {
+    if raf.is_some() {
         // The EXIF we read describes the embedded preview, not the sensor image.
         (meta.width, meta.height) = (None, None);
     } else if let Ok(size) = imagesize::size(path) {
@@ -109,18 +102,6 @@ pub fn read_path(path: &Path) -> Result<PhotoMeta> {
         meta.height = u32::try_from(size.height).ok();
     }
     Ok(meta)
-}
-
-/// Like `read_exact`, but a short file is not an error. Returns bytes read.
-fn read_up_to(r: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
-    let mut n = 0;
-    while n < buf.len() {
-        match r.read(&mut buf[n..])? {
-            0 => break,
-            k => n += k,
-        }
-    }
-    Ok(n)
 }
 
 /// Builds [`PhotoMeta`] from parsed EXIF.

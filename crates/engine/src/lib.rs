@@ -13,6 +13,7 @@ use tintype_index::PhotoIndex;
 use tintype_jobs::ScanOptions;
 
 pub use tintype_catalog::PhotoRecord;
+pub use tintype_codecs::{self as codecs, Rgba, ThumbCache, decode_preview};
 pub use tintype_index::{FACET_FIELDS, FacetCount, Hit, SearchResults, Sort};
 pub use tintype_jobs::{ScanProgress, ScanReport};
 
@@ -28,6 +29,8 @@ pub enum Error {
     Library { path: PathBuf, source: std::io::Error },
     #[error("no photo {0} in the library")]
     PhotoNotFound(String),
+    #[error("no library folders to rescan; add one first")]
+    NoFolders,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -46,6 +49,12 @@ pub enum Command {
     /// Add folders to the library, or refresh them.
     Scan {
         roots: Vec<PathBuf>,
+        #[serde(default = "yes")]
+        hash: bool,
+    },
+    /// Refresh every folder previously added with `Scan`. Folders that are
+    /// currently missing (an unplugged drive) are skipped, not emptied.
+    Rescan {
         #[serde(default = "yes")]
         hash: bool,
     },
@@ -113,6 +122,7 @@ pub struct Stats {
     pub library: String,
     pub photos: u64,
     pub indexed: u64,
+    pub folders: Vec<String>,
 }
 
 /// Progress from long-running commands.
@@ -127,10 +137,14 @@ pub fn default_library_dir() -> Option<PathBuf> {
     directories::ProjectDirs::from("", "", "Tintype").map(|d| d.data_dir().join("library"))
 }
 
+/// Long edge, in pixels, of cached grid thumbnails.
+pub const THUMB_EDGE: u32 = 400;
+
 pub struct Engine {
     dir: PathBuf,
     catalog: Catalog,
     index: PhotoIndex,
+    thumbs: Arc<ThumbCache>,
     cancel: Arc<AtomicBool>,
 }
 
@@ -142,7 +156,8 @@ impl Engine {
         std::fs::create_dir_all(dir).map_err(lib_err)?;
         let catalog = Catalog::open(&dir.join("catalog.db"))?;
         let (index, fresh) = PhotoIndex::open(&dir.join("index"))?;
-        let mut engine = Self { dir: dir.to_path_buf(), catalog, index, cancel: Arc::default() };
+        let thumbs = Arc::new(ThumbCache::new(dir.join("thumbs"), THUMB_EDGE));
+        let mut engine = Self { dir: dir.to_path_buf(), catalog, index, thumbs, cancel: Arc::default() };
         if fresh || engine.index.doc_count() != engine.catalog.count()? {
             tracing::info!(fresh, "rebuilding search index");
             engine.reindex(&mut |_| {})?;
@@ -154,6 +169,12 @@ impl Engine {
         &self.dir
     }
 
+    /// The thumbnail cache. Thread-safe, so a UI can decode off its main thread
+    /// while the engine is busy with a command.
+    pub fn thumbnails(&self) -> Arc<ThumbCache> {
+        self.thumbs.clone()
+    }
+
     /// Set this flag from another thread to stop the running command early.
     pub fn cancel_flag(&self) -> Arc<AtomicBool> {
         self.cancel.clone()
@@ -163,6 +184,14 @@ impl Engine {
         self.cancel.store(false, Ordering::Relaxed);
         match cmd {
             Command::Scan { roots, hash } => self.scan(&roots, hash, events).map(Response::Scan),
+            Command::Rescan { hash } => {
+                let roots: Vec<PathBuf> =
+                    self.catalog.roots()?.into_iter().map(PathBuf::from).filter(|r| r.is_dir()).collect();
+                if roots.is_empty() {
+                    return Err(Error::NoFolders);
+                }
+                self.scan(&roots, hash, events).map(Response::Scan)
+            }
             Command::Search { query, sort, limit, offset } => {
                 Ok(Response::Search(self.index.search(&query, sort, limit, offset)?))
             }
@@ -185,6 +214,7 @@ impl Engine {
                 library: self.dir.display().to_string(),
                 photos: self.catalog.count()?,
                 indexed: self.index.doc_count(),
+                folders: self.catalog.roots()?,
             })),
         }
     }
@@ -193,6 +223,7 @@ impl Engine {
         let opts = ScanOptions { hash, ..ScanOptions::default() };
         let report =
             tintype_jobs::scan(&mut self.catalog, roots, &opts, &self.cancel, &mut |p| events(Event::Scan(p)))?;
+        self.catalog.add_roots(&report.roots)?;
 
         self.index.remove(&report.removed_ids)?;
         for &id in &report.changed_ids {
@@ -286,6 +317,10 @@ mod tests {
 
         assert_eq!(hits(&mut engine, ""), vec!["canon.jpg", "nikon.jpg"], "newest first");
         assert_eq!(hits(&mut engine, "iso:>=1000"), vec!["canon.jpg"]);
+        let Response::Scan(report) = engine.execute(Command::Rescan { hash: true }, &mut |_| {}).unwrap() else {
+            panic!()
+        };
+        assert_eq!(report.unchanged, 2, "rescan covers the added folder");
 
         let photo = PhotoRef::Path(photos.path().join("trip/nikon.jpg"));
         let tag = Command::Tag { photo: photo.clone(), add: vec!["sunset".into()], remove: vec![] };
@@ -310,6 +345,14 @@ mod tests {
         assert!(matches!(cmd, Command::Search { limit: 50, sort: Sort::Relevance, .. }));
         let cmd: Command = serde_json::from_str(r#"{"command":"rate","photo":12,"rating":null}"#).unwrap();
         assert!(matches!(cmd, Command::Rate { photo: PhotoRef::Id(12), rating: None }));
+    }
+
+    #[test]
+    fn rescan_needs_folders() {
+        let lib = tempfile::tempdir().unwrap();
+        let mut engine = Engine::open(lib.path()).unwrap();
+        let err = engine.execute(Command::Rescan { hash: false }, &mut |_| {}).unwrap_err();
+        assert!(matches!(err, Error::NoFolders));
     }
 
     #[test]

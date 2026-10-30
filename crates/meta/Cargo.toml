@@ -12,6 +12,7 @@ imagesize.workspace = true
 kamadak-exif.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+tintype-codecs.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

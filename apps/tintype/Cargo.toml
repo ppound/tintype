@@ -1,0 +1,11 @@
+[package]
+name = "tintype"
+description = "Tintype desktop app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+rfd.workspace = true
+tintype-ui-egui.workspace = true

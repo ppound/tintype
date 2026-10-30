@@ -11,7 +11,8 @@ use serde_json::Value;
 
 /// Lower layers may not depend on higher ones, nor on peers in their own layer.
 const LAYERS: &[&[&str]] = &[
-    &["tintype-meta", "tintype-codecs", "tintype-infer", "tintype-testkit"],
+    &["tintype-codecs", "tintype-infer", "tintype-testkit"],
+    &["tintype-meta"],
     &["tintype-catalog"],
     &["tintype-index", "tintype-analyze", "tintype-faces"],
     &["tintype-jobs"],
