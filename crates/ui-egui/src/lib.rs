@@ -18,7 +18,7 @@ pub fn run(library: Option<PathBuf>) -> Result<(), String> {
     let screenshot = std::env::var_os("TINTYPE_SCREENSHOT").map(|path| ScreenshotPlan {
         path: path.into(),
         select: std::env::var("TINTYPE_SCREENSHOT_SELECT").ok().and_then(|v| v.parse().ok()),
-        loupe: std::env::var("TINTYPE_SCREENSHOT_VIEW").is_ok_and(|v| v == "loupe"),
+        view: std::env::var("TINTYPE_SCREENSHOT_VIEW").ok(),
     });
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

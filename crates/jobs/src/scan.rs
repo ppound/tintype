@@ -63,6 +63,9 @@ pub struct ScanReport {
     pub changed_ids: Vec<i64>,
     #[serde(skip)]
     pub removed_ids: Vec<i64>,
+    /// Faces deleted along with removed photos; the caller deletes their crops.
+    #[serde(skip)]
+    pub removed_face_ids: Vec<i64>,
 }
 
 struct Candidate {
@@ -172,7 +175,7 @@ pub fn scan(
             .filter(|(path, _)| !Path::new(path).exists())
             .map(|(_, fp)| fp.id)
             .collect();
-        catalog.remove_many(&report.removed_ids)?;
+        report.removed_face_ids = catalog.remove_many(&report.removed_ids)?;
         report.removed = report.removed_ids.len() as u64;
     }
 

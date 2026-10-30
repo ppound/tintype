@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+mimalloc.workspace = true
 serde_json.workspace = true
 tintype-engine.workspace = true
 tracing-subscriber.workspace = true

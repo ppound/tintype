@@ -9,13 +9,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 use tintype_catalog::Catalog;
+use tintype_faces::{FACES_VERSION, FaceAnalyzer};
 use tintype_index::PhotoIndex;
+use tintype_infer::{ModelStore, SFACE, YUNET};
 use tintype_jobs::ScanOptions;
 
-pub use tintype_catalog::PhotoRecord;
+pub use tintype_catalog::{FaceGroup, FaceInfo, Person, PhotoRecord};
 pub use tintype_codecs::{self as codecs, Rgba, ThumbCache, decode_preview};
 pub use tintype_index::{FACET_FIELDS, FacetCount, Hit, SearchResults, Sort};
-pub use tintype_jobs::{ScanProgress, ScanReport};
+pub use tintype_jobs::{FacesReport, ScanProgress, ScanReport, face_crop_path};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -25,6 +27,12 @@ pub enum Error {
     Index(#[from] tintype_index::Error),
     #[error(transparent)]
     Scan(#[from] tintype_jobs::scan::Error),
+    #[error(transparent)]
+    Faces(#[from] tintype_jobs::faces::Error),
+    #[error(transparent)]
+    Model(#[from] tintype_infer::Error),
+    #[error(transparent)]
+    Analyzer(#[from] tintype_faces::Error),
     #[error("{path}: {source}")]
     Library { path: PathBuf, source: std::io::Error },
     #[error("no photo {0} in the library")]
@@ -94,6 +102,45 @@ pub enum Command {
     /// Rebuild the search index from the catalog.
     Reindex,
     Stats,
+
+    /// Find faces in up to `batch` photos that haven't been analyzed (downloading
+    /// the face models first if needed). Repeat until `remaining` is 0; other
+    /// commands can run between batches.
+    FindFaces {
+        #[serde(default = "default_face_batch")]
+        batch: usize,
+    },
+    /// Named people and unnamed groups of similar faces.
+    People,
+    PhotoFaces {
+        photo: PhotoRef,
+    },
+    /// A person's faces, suggestions first.
+    PersonFaces {
+        person: i64,
+    },
+    /// Confirm faces as `name` (a new or existing person).
+    NameFaces {
+        faces: Vec<i64>,
+        name: String,
+    },
+    /// "Not this person": unname a face and stop suggesting that person for it.
+    RejectFace {
+        face: i64,
+    },
+    /// Take a face out of its unnamed group.
+    UngroupFace {
+        face: i64,
+    },
+    /// Rename a person; renaming to another person's name merges the two.
+    RenamePerson {
+        person: i64,
+        name: String,
+    },
+    /// Forget a person; their faces become unnamed.
+    DeletePerson {
+        person: i64,
+    },
 }
 
 fn yes() -> bool {
@@ -105,16 +152,39 @@ fn default_limit() -> usize {
 fn facet_root() -> String {
     "/".into()
 }
+fn default_face_batch() -> usize {
+    150
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "response", rename_all = "snake_case")]
 pub enum Response {
     Scan(ScanReport),
     Search(SearchResults),
-    Facets { counts: Vec<FacetCount> },
+    Facets {
+        counts: Vec<FacetCount>,
+    },
     Photo(Box<PhotoRecord>),
-    Reindexed { photos: u64 },
+    Reindexed {
+        photos: u64,
+    },
     Stats(Stats),
+    Faces(FacesReport),
+    People {
+        people: Vec<Person>,
+        groups: Vec<FaceGroup>,
+        /// Photos not yet analyzed for faces.
+        unscanned: u64,
+        /// Face models are downloaded.
+        models_ready: bool,
+    },
+    FaceList {
+        faces: Vec<FaceInfo>,
+    },
+    /// A people edit; `photos` were reindexed.
+    Changed {
+        photos: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -130,12 +200,23 @@ pub struct Stats {
 pub enum Event {
     Scan(ScanProgress),
     Reindex { done: u64, total: u64 },
+    Download { model: &'static str, done: u64, total: u64 },
+    Faces { done: u64, total: u64 },
 }
 
 /// Where the library lives when the user doesn't choose: the OS data dir.
 pub fn default_library_dir() -> Option<PathBuf> {
     directories::ProjectDirs::from("", "", "Tintype").map(|d| d.data_dir().join("library"))
 }
+
+/// Where downloaded models live: shared by all libraries.
+fn models_dir(library: &Path) -> PathBuf {
+    directories::ProjectDirs::from("", "", "Tintype")
+        .map_or_else(|| library.join("models"), |d| d.data_dir().join("models"))
+}
+
+/// Face passes between full recognition runs while a long face scan is going.
+const RECOGNIZE_EVERY: u32 = 4;
 
 /// Long edge, in pixels, of cached grid thumbnails.
 pub const THUMB_EDGE: u32 = 400;
@@ -146,6 +227,9 @@ pub struct Engine {
     index: PhotoIndex,
     thumbs: Arc<ThumbCache>,
     cancel: Arc<AtomicBool>,
+    models: ModelStore,
+    analyzer: Option<Arc<FaceAnalyzer>>,
+    batches_since_recognize: u32,
 }
 
 impl Engine {
@@ -157,7 +241,16 @@ impl Engine {
         let catalog = Catalog::open(&dir.join("catalog.db"))?;
         let (index, fresh) = PhotoIndex::open(&dir.join("index"))?;
         let thumbs = Arc::new(ThumbCache::new(dir.join("thumbs"), THUMB_EDGE));
-        let mut engine = Self { dir: dir.to_path_buf(), catalog, index, thumbs, cancel: Arc::default() };
+        let mut engine = Self {
+            dir: dir.to_path_buf(),
+            catalog,
+            index,
+            thumbs,
+            cancel: Arc::default(),
+            models: ModelStore::new(models_dir(dir)),
+            analyzer: None,
+            batches_since_recognize: 0,
+        };
         if fresh || engine.index.doc_count() != engine.catalog.count()? {
             tracing::info!(fresh, "rebuilding search index");
             engine.reindex(&mut |_| {})?;
@@ -173,6 +266,11 @@ impl Engine {
     /// while the engine is busy with a command.
     pub fn thumbnails(&self) -> Arc<ThumbCache> {
         self.thumbs.clone()
+    }
+
+    /// Folder holding face crops; see [`face_crop_path`].
+    pub fn faces_dir(&self) -> PathBuf {
+        self.dir.join("faces")
     }
 
     /// Set this flag from another thread to stop the running command early.
@@ -216,7 +314,94 @@ impl Engine {
                 indexed: self.index.doc_count(),
                 folders: self.catalog.roots()?,
             })),
+
+            Command::FindFaces { batch } => self.find_faces(batch, events).map(Response::Faces),
+            Command::People => Ok(Response::People {
+                people: self.catalog.people()?,
+                groups: self.catalog.face_groups(usize::MAX)?,
+                unscanned: self.catalog.count_needing_faces(FACES_VERSION)?,
+                models_ready: self.models.is_installed(&YUNET) && self.models.is_installed(&SFACE),
+            }),
+            Command::PhotoFaces { photo } => {
+                let id = self.resolve(&photo)?.id;
+                Ok(Response::FaceList { faces: self.catalog.photo_faces(id)? })
+            }
+            Command::PersonFaces { person } => Ok(Response::FaceList { faces: self.catalog.person_faces(person)? }),
+            Command::NameFaces { faces, name } => {
+                let photos = self.catalog.photos_of_faces(&faces)?;
+                self.catalog.name_faces(&faces, &name)?;
+                self.after_people_edit(photos)
+            }
+            Command::RejectFace { face } => {
+                let photos = self.catalog.photos_of_faces(&[face])?;
+                self.catalog.reject_face(face)?;
+                self.after_people_edit(photos)
+            }
+            Command::UngroupFace { face } => {
+                self.catalog.ungroup_face(face)?;
+                self.after_people_edit(Vec::new())
+            }
+            Command::RenamePerson { person, name } => {
+                let photos = self.catalog.photos_of_person(person)?;
+                self.catalog.rename_person(person, &name)?;
+                self.after_people_edit(photos)
+            }
+            Command::DeletePerson { person } => {
+                let photos = self.catalog.photos_of_person(person)?;
+                self.catalog.delete_person(person)?;
+                self.after_people_edit(photos)
+            }
         }
+    }
+
+    fn analyzer(&mut self, events: &mut dyn FnMut(Event)) -> Result<Arc<FaceAnalyzer>> {
+        if let Some(a) = &self.analyzer {
+            return Ok(a.clone());
+        }
+        let mut paths = Vec::new();
+        for spec in [YUNET, SFACE] {
+            let mut progress = |done, total| events(Event::Download { model: spec.name, done, total });
+            paths.push(self.models.ensure(&spec, &mut progress)?);
+        }
+        let analyzer = Arc::new(FaceAnalyzer::load(&paths[0], &paths[1])?);
+        self.analyzer = Some(analyzer.clone());
+        Ok(analyzer)
+    }
+
+    fn find_faces(&mut self, batch: usize, events: &mut dyn FnMut(Event)) -> Result<FacesReport> {
+        let analyzer = self.analyzer(events)?;
+        let crops = self.faces_dir();
+        let mut progress = |done, total| events(Event::Faces { done, total });
+        let mut report =
+            tintype_jobs::find_faces(&mut self.catalog, &analyzer, &crops, batch.max(1), &self.cancel, &mut progress)?;
+        let mut changed = std::mem::take(&mut report.changed_photos);
+        // Matching looks at every face, so during a long scan it runs every few batches, and at the end.
+        self.batches_since_recognize += 1;
+        if report.remaining == 0 || report.cancelled || self.batches_since_recognize >= RECOGNIZE_EVERY {
+            self.batches_since_recognize = 0;
+            changed.extend(tintype_jobs::recognize(&mut self.catalog)?);
+        }
+        self.reindex_photos(changed)?;
+        Ok(report)
+    }
+
+    /// After naming changes: re-match everyone, then reindex affected photos.
+    fn after_people_edit(&mut self, mut photos: Vec<i64>) -> Result<Response> {
+        photos.extend(tintype_jobs::recognize(&mut self.catalog)?);
+        let n = self.reindex_photos(photos)?;
+        Ok(Response::Changed { photos: n })
+    }
+
+    fn reindex_photos(&mut self, mut ids: Vec<i64>) -> Result<u64> {
+        ids.sort_unstable();
+        ids.dedup();
+        for &id in &ids {
+            if let Some(rec) = self.catalog.get(id)? {
+                self.index.upsert([&rec])?;
+            }
+        }
+        self.index.commit()?;
+        Ok(ids.len() as u64)
     }
 
     fn scan(&mut self, roots: &[PathBuf], hash: bool, events: &mut dyn FnMut(Event)) -> Result<ScanReport> {
@@ -224,6 +409,9 @@ impl Engine {
         let report =
             tintype_jobs::scan(&mut self.catalog, roots, &opts, &self.cancel, &mut |p| events(Event::Scan(p)))?;
         self.catalog.add_roots(&report.roots)?;
+        for &face in &report.removed_face_ids {
+            let _ = std::fs::remove_file(face_crop_path(&self.faces_dir(), face));
+        }
 
         self.index.remove(&report.removed_ids)?;
         for &id in &report.changed_ids {

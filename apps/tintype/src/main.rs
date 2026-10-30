@@ -5,6 +5,10 @@
 
 use std::path::PathBuf;
 
+// Faster than the system allocator for parallel decoding and inference.
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let mut library = std::env::var_os("TINTYPE_LIBRARY").map(PathBuf::from);

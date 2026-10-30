@@ -19,6 +19,9 @@ use tintype_engine::{
 use crate::backend::{Backend, Job, Msg};
 use crate::thumbs::{Slot, Thumbs};
 
+mod people;
+use people::PeopleState;
+
 /// Upper bound on hits loaded into the grid.
 const SEARCH_LIMIT: usize = 200_000;
 const TYPING_DEBOUNCE: Duration = Duration::from_millis(250);
@@ -32,6 +35,7 @@ const FACETS: &[(&str, &str)] = &[
     ("Lens", "lenses"),
     ("Date", "date"),
     ("Tags", "tags"),
+    ("People", "people"),
     ("File type", "ext"),
     ("Folder", "folder"),
 ];
@@ -48,6 +52,12 @@ impl Default for Settings {
     fn default() -> Self {
         Self { thumb_size: 160.0, sort: Sort::Newest }
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Photos,
+    People,
 }
 
 #[derive(PartialEq, Eq)]
@@ -72,7 +82,8 @@ pub struct ScreenshotPlan {
     pub path: PathBuf,
     /// Select this result index once results arrive.
     pub select: Option<usize>,
-    pub loupe: bool,
+    /// "loupe", "people" or "person" (the first person's page).
+    pub view: Option<String>,
 }
 
 struct Screenshot {
@@ -87,6 +98,10 @@ pub struct TintypeApp {
     backend: Backend,
     thumbs: Thumbs,
     settings: Settings,
+    tab: Tab,
+    people: PeopleState,
+    /// Photo to open once the next search returns (from a face on the People tab).
+    pending_open: Option<i64>,
 
     query: String,
     /// The search box's widget id, for focusing it with Ctrl+F.
@@ -135,6 +150,9 @@ impl TintypeApp {
             backend,
             thumbs,
             settings,
+            tab: Tab::Photos,
+            people: PeopleState::default(),
+            pending_open: None,
             query: String::new(),
             search_box: None,
             query_error: None,
@@ -220,6 +238,7 @@ impl TintypeApp {
         self.selected = Some(index);
         self.scroll_to_selected = true;
         self.detail_seq = self.backend.send(Job::Show, Command::Show { photo: PhotoRef::Id(id) });
+        self.load_photo_faces(id);
     }
 
     fn rate(&mut self, id: i64, rating: Option<u8>) {
@@ -270,6 +289,9 @@ impl TintypeApp {
     }
 
     fn on_progress(&mut self, event: Event) {
+        if self.on_face_progress(event) {
+            return;
+        }
         let Some(scan) = &mut self.scan else { return };
         (scan.label, scan.fraction) = match event {
             Event::Scan(ScanProgress::Walking { found }) => (format!("Finding photos… {}", thousands(found)), None),
@@ -280,10 +302,14 @@ impl TintypeApp {
             Event::Reindex { done, total } => {
                 ("Updating search index…".into(), Some(done as f32 / total.max(1) as f32))
             }
+            Event::Download { .. } | Event::Faces { .. } => return,
         };
     }
 
     fn on_reply(&mut self, job: Job, seq: u64, result: Result<Response, String>) {
+        if self.on_people_reply(job, seq, &result) {
+            return;
+        }
         match (job, result) {
             (Job::Search, _) if seq != self.search_seq => {}
             (Job::Search, Ok(Response::Search(r))) => {
@@ -296,6 +322,12 @@ impl TintypeApp {
                 if self.selected.is_none() {
                     self.detail = None;
                     self.view = View::Grid;
+                }
+                if let Some(photo) = self.pending_open.take()
+                    && let Some(i) = self.results.iter().position(|h| h.id == photo)
+                {
+                    self.select(i);
+                    self.view = View::Loupe;
                 }
             }
             (Job::Search, Err(e)) => self.query_error = Some(e),
@@ -362,7 +394,8 @@ impl TintypeApp {
         {
             ctx.memory_mut(|m| m.request_focus(id));
         }
-        if ctx.egui_wants_keyboard_input() || self.results.is_empty() {
+        self.people_keys(ctx);
+        if ctx.egui_wants_keyboard_input() || self.results.is_empty() || self.tab != Tab::Photos {
             return;
         }
         let pressed = |key| ctx.input(|i| i.key_pressed(key));
@@ -405,6 +438,19 @@ impl TintypeApp {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Tintype").strong().size(18.0));
             ui.add_space(12.0);
+            for (tab, label) in [(Tab::Photos, "Photos"), (Tab::People, "People")] {
+                if ui.selectable_label(self.tab == tab, RichText::new(label).size(15.0)).clicked() && self.tab != tab {
+                    self.tab = tab;
+                    if tab == Tab::People {
+                        self.refresh_people();
+                    }
+                }
+            }
+            ui.add_space(12.0);
+            if self.tab == Tab::People {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| self.library_buttons(ui));
+                return;
+            }
             let search_width = (ui.available_width() - 470.0).max(220.0);
             let resp = ui.add(
                 TextEdit::singleline(&mut self.query)
@@ -425,17 +471,7 @@ impl TintypeApp {
             }
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let idle = self.scan.is_none();
-                if ui
-                    .add_enabled(idle, Button::new("Rescan"))
-                    .on_hover_text("Look for new, changed and removed photos in your folders")
-                    .clicked()
-                {
-                    self.start_scan(Command::Rescan { hash: true });
-                }
-                if ui.add_enabled(idle, Button::new("Add folder…")).clicked() {
-                    self.add_folder();
-                }
+                self.library_buttons(ui);
                 ui.add(egui::Slider::new(&mut self.settings.thumb_size, 96.0..=320.0).show_value(false))
                     .on_hover_text("Thumbnail size");
                 let before = self.settings.sort;
@@ -450,6 +486,10 @@ impl TintypeApp {
             });
         });
 
+        if self.tab == Tab::People {
+            ui.add_space(4.0);
+            return;
+        }
         if let Some(err) = &self.query_error {
             ui.colored_label(ui.visuals().error_fg_color, err);
         }
@@ -477,6 +517,21 @@ impl TintypeApp {
         ui.add_space(4.0);
     }
 
+    /// Rescan and Add folder, right-aligned in the top bar.
+    fn library_buttons(&mut self, ui: &mut egui::Ui) {
+        let idle = self.scan.is_none();
+        if ui
+            .add_enabled(idle, Button::new("Rescan"))
+            .on_hover_text("Look for new, changed and removed photos in your folders")
+            .clicked()
+        {
+            self.start_scan(Command::Rescan { hash: true });
+        }
+        if ui.add_enabled(idle, Button::new("Add folder…")).clicked() {
+            self.add_folder();
+        }
+    }
+
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if let Some(scan) = &self.scan {
@@ -486,7 +541,7 @@ impl TintypeApp {
                     ui.add(egui::ProgressBar::new(f).desired_width(160.0));
                 }
                 if ui.small_button("Cancel").clicked() {
-                    self.backend.cancel();
+                    self.stop_jobs();
                 }
             } else if let Some(stats) = &self.stats {
                 ui.label(format!("{} photos", thousands(stats.photos)));
@@ -658,6 +713,8 @@ impl TintypeApp {
                 edit.request_focus();
             }
 
+            self.photo_faces_section(ui, p.id);
+
             if let Some(e) = &p.error {
                 ui.add_space(8.0);
                 ui.colored_label(ui.visuals().warn_fg_color, format!("Metadata could not be read: {e}"));
@@ -804,7 +861,9 @@ impl TintypeApp {
         let tex = tex.or_else(|| self.thumbs.loaded_thumb(hit.id).cloned());
         let painter = ui.painter_at(rect);
         if let Some(t) = &tex {
-            painter.image(t.id(), fit(t.size_vec2(), rect.shrink(16.0)), full_uv(), Color32::WHITE);
+            let image = fit(t.size_vec2(), rect.shrink(16.0));
+            painter.image(t.id(), image, full_uv(), Color32::WHITE);
+            self.paint_face_boxes(&painter, hit.id, image);
         }
         if loading {
             ui.put(Rect::from_center_size(rect.center(), vec2(32.0, 32.0)), egui::Spinner::new());
@@ -814,7 +873,8 @@ impl TintypeApp {
         }
 
         let name = Path::new(&hit.path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let caption = format!("{name}   ·   {} of {}   ·   ← → to browse, Esc for grid", i + 1, self.results.len());
+        let caption =
+            format!("{name}   ·   {} of {}   ·   ← → to browse, F for faces, Esc for grid", i + 1, self.results.len());
         painter.text(
             pos2(rect.center().x, rect.bottom() - 8.0),
             Align2::CENTER_BOTTOM,
@@ -834,14 +894,25 @@ impl TintypeApp {
         ctx.request_repaint();
         if !s.selected && !self.results.is_empty() {
             s.selected = true;
+            let view = s.plan.view.clone();
             if let Some(i) = s.plan.select {
-                let loupe = s.plan.loupe;
                 self.select(i.min(self.results.len() - 1));
-                if loupe {
-                    self.view = View::Loupe;
+            }
+            match view.as_deref() {
+                Some("loupe") => self.view = View::Loupe,
+                Some("people" | "person") => {
+                    self.tab = Tab::People;
+                    self.refresh_people();
                 }
+                _ => {}
             }
             return;
+        }
+        if self.screenshot.as_ref().is_some_and(|s| s.plan.view.as_deref() == Some("person"))
+            && self.people.person.is_none()
+            && let Some(first) = self.people.people.first().map(|p| p.id)
+        {
+            self.open_person(first);
         }
         let Some(s) = &mut self.screenshot else { return };
         let settled = s.frames > 90 && self.thumbs.queued() == 0 && self.scan.is_none();
@@ -884,6 +955,12 @@ impl eframe::App for TintypeApp {
         let empty_library = self.stats.as_ref().is_some_and(|s| s.photos == 0) && self.scan.is_none();
         egui::Panel::top("top").show(ui, |ui| self.top_bar(ui));
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
+        if self.tab == Tab::People && !empty_library {
+            egui::CentralPanel::default().show(ui, |ui| self.people_view(ui));
+            self.thumbs.end_frame();
+            self.screenshot_step(&ctx);
+            return;
+        }
         if !empty_library {
             egui::Panel::left("facets")
                 .resizable(true)

@@ -1,5 +1,6 @@
 //! Runs the engine on its own thread so the UI never blocks on a command.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -17,6 +18,11 @@ pub enum Job {
     Edit,
     Scan,
     Stats,
+    People,
+    PhotoFaces,
+    PersonFaces,
+    FindFaces,
+    PeopleEdit,
 }
 
 pub struct Reply {
@@ -37,6 +43,7 @@ pub struct Backend {
     seq: u64,
     cancel: Arc<AtomicBool>,
     thumbs: Arc<ThumbCache>,
+    faces_dir: PathBuf,
 }
 
 impl Backend {
@@ -45,6 +52,7 @@ impl Backend {
         let (out, rx) = unbounded();
         let cancel = engine.cancel_flag();
         let thumbs = engine.thumbnails();
+        let faces_dir = engine.faces_dir();
         thread::Builder::new()
             .name("tintype-engine".into())
             .spawn(move || {
@@ -61,7 +69,7 @@ impl Backend {
                 }
             })
             .expect("spawn engine thread");
-        Self { tx, rx, seq: 0, cancel, thumbs }
+        Self { tx, rx, seq: 0, cancel, thumbs, faces_dir }
     }
 
     /// Queues a command; returns its sequence number.
@@ -83,5 +91,9 @@ impl Backend {
 
     pub fn thumbs(&self) -> Arc<ThumbCache> {
         self.thumbs.clone()
+    }
+
+    pub fn face_crop(&self, face: i64) -> PathBuf {
+        tintype_engine::face_crop_path(&self.faces_dir, face)
     }
 }

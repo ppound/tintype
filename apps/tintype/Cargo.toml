@@ -7,5 +7,6 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+mimalloc.workspace = true
 rfd.workspace = true
 tintype-ui-egui.workspace = true

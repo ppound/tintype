@@ -13,7 +13,9 @@ serde.workspace = true
 thiserror.workspace = true
 tintype-catalog.workspace = true
 tintype-codecs.workspace = true
+tintype-faces.workspace = true
 tintype-index.workspace = true
+tintype-infer.workspace = true
 tintype-jobs.workspace = true
 tracing.workspace = true
 

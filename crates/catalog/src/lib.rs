@@ -10,6 +10,9 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::Serialize;
 use tintype_meta::PhotoMeta;
 
+mod faces;
+pub use faces::{FaceGroup, FaceInfo, FaceRow, NewFace, Person, Suggestion};
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("database error: {0}")]
@@ -51,6 +54,34 @@ const MIGRATIONS: &[&str] = &[
     r#"
     CREATE TABLE roots (path TEXT PRIMARY KEY);
 "#,
+    r#"
+    CREATE TABLE people (
+        id   INTEGER PRIMARY KEY,
+        name TEXT    NOT NULL UNIQUE COLLATE NOCASE
+    );
+    CREATE TABLE faces (
+        id        INTEGER PRIMARY KEY,
+        photo_id  INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
+        x REAL NOT NULL, y REAL NOT NULL, w REAL NOT NULL, h REAL NOT NULL,
+        score     REAL    NOT NULL,
+        embedding BLOB    NOT NULL,
+        person_id INTEGER REFERENCES people(id) ON DELETE SET NULL,
+        -- 1: the user named this face; 0: person_id (if any) is a suggestion.
+        confirmed INTEGER NOT NULL DEFAULT 0,
+        rejected_person_id INTEGER REFERENCES people(id) ON DELETE SET NULL,
+        -- 1: the user took this face out of its group; don't group it again.
+        ungrouped INTEGER NOT NULL DEFAULT 0,
+        grp       INTEGER
+    );
+    CREATE INDEX faces_photo ON faces(photo_id);
+    CREATE INDEX faces_person ON faces(person_id);
+    CREATE INDEX faces_grp ON faces(grp);
+    ALTER TABLE photos ADD COLUMN faces_version INTEGER NOT NULL DEFAULT 0;
+"#,
+    r#"
+    -- How well a suggested face matched its person (higher is more likely).
+    ALTER TABLE faces ADD COLUMN suggest_score REAL;
+"#,
 ];
 
 /// A photo as produced by a scan, before it has an id.
@@ -87,6 +118,10 @@ pub struct PhotoRecord {
     pub error: Option<String>,
     pub rating: Option<u8>,
     pub tags: Vec<String>,
+    /// Names of the people in this photo (confirmed or suggested), sorted.
+    pub people: Vec<String>,
+    /// Faces found in this photo.
+    pub faces: u32,
     pub indexed_at: i64,
 }
 
@@ -150,6 +185,9 @@ impl Catalog {
                     -- Same size and mtime means same content: keep a hash we didn't recompute.
                     hash = CASE WHEN excluded.size = photos.size AND excluded.mtime_ns = photos.mtime_ns
                                 THEN COALESCE(excluded.hash, photos.hash) ELSE excluded.hash END,
+                    -- Changed pixels need a new face pass.
+                    faces_version = CASE WHEN excluded.size = photos.size AND excluded.mtime_ns = photos.mtime_ns
+                                THEN photos.faces_version ELSE 0 END,
                     size = excluded.size, mtime_ns = excluded.mtime_ns,
                     meta = excluded.meta, meta_version = excluded.meta_version,
                     error = excluded.error, indexed_at = excluded.indexed_at
@@ -168,7 +206,10 @@ impl Catalog {
         Ok(ids)
     }
 
-    pub fn remove_many(&mut self, ids: &[i64]) -> Result<()> {
+    /// Deletes photos (and their faces). Returns the ids of the deleted faces,
+    /// so their crops can be cleaned up.
+    pub fn remove_many(&mut self, ids: &[i64]) -> Result<Vec<i64>> {
+        let faces = self.faces_of_photos(ids)?;
         let tx = self.conn.transaction()?;
         {
             let mut stmt = tx.prepare_cached("DELETE FROM photos WHERE id = ?1")?;
@@ -177,7 +218,7 @@ impl Catalog {
             }
         }
         tx.commit()?;
-        Ok(())
+        Ok(faces)
     }
 
     pub fn get(&self, id: i64) -> Result<Option<PhotoRecord>> {
@@ -186,6 +227,7 @@ impl Catalog {
             return Ok(None);
         };
         raw.rec.tags = self.tags(id)?;
+        (raw.rec.people, raw.rec.faces) = self.photo_people(id)?;
         Ok(Some(raw.finish()?))
     }
 
@@ -203,11 +245,13 @@ impl Catalog {
             let (id, tag) = row?;
             tags.entry(id).or_default().push(tag);
         }
+        let mut people = self.people_by_photo()?;
 
         let mut stmt = self.conn.prepare(&format!("{SELECT_PHOTO} ORDER BY id"))?;
         for row in stmt.query_map([], read_row)? {
             let mut raw = row?;
             raw.rec.tags = tags.remove(&raw.rec.id).unwrap_or_default();
+            (raw.rec.people, raw.rec.faces) = people.remove(&raw.rec.id).unwrap_or_default();
             f(raw.finish()?);
         }
         Ok(())
@@ -290,6 +334,8 @@ fn read_row(r: &Row) -> rusqlite::Result<RawRecord> {
             error: r.get(6)?,
             rating: r.get(7)?,
             tags: Vec::new(),
+            people: Vec::new(),
+            faces: 0,
             indexed_at: r.get(8)?,
         },
         meta_json: r.get(5)?,

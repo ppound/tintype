@@ -17,6 +17,8 @@ use tintype_engine::{Rgba, ThumbCache};
 
 /// Long edge of the full-view preview.
 const PREVIEW_EDGE: u32 = 2560;
+/// Long edge of face crops as displayed.
+const FACE_EDGE: u32 = 160;
 /// Textures kept before off-screen ones are dropped.
 const MAX_TEXTURES: usize = 1500;
 /// Uploads per frame; more would make scrolling stutter.
@@ -26,6 +28,7 @@ const UPLOADS_PER_FRAME: usize = 24;
 enum Kind {
     Thumb,
     Preview,
+    Face,
 }
 
 struct Request {
@@ -60,6 +63,7 @@ pub struct Thumbs {
     results: Receiver<(i64, Kind, Outcome)>,
     thumbs: HashMap<i64, Slot>,
     preview: Option<(i64, Slot)>,
+    faces: HashMap<i64, Slot>,
 }
 
 impl Thumbs {
@@ -76,7 +80,15 @@ impl Thumbs {
                 .spawn(move || worker(&queue, &wanted, &cache, &tx, &ctx))
                 .expect("spawn thumbnail worker");
         }
-        Self { queue, wanted, seen_this_frame: HashSet::new(), results, thumbs: HashMap::new(), preview: None }
+        Self {
+            queue,
+            wanted,
+            seen_this_frame: HashSet::new(),
+            results,
+            thumbs: HashMap::new(),
+            preview: None,
+            faces: HashMap::new(),
+        }
     }
 
     /// Call once per frame before drawing: uploads finished images.
@@ -105,6 +117,12 @@ impl Thumbs {
                     self.preview = Some((id, slot));
                 }
                 (Kind::Preview, _) => {}
+                (Kind::Face, Some(slot)) => {
+                    self.faces.insert(id, slot);
+                }
+                (Kind::Face, None) => {
+                    self.faces.remove(&id);
+                }
             }
         }
         if uploaded == UPLOADS_PER_FRAME {
@@ -140,6 +158,15 @@ impl Thumbs {
             self.preview = Some((id, Slot::Pending));
         }
         &self.preview.as_ref().expect("just set").1
+    }
+
+    /// The display crop of a face, requesting it if needed.
+    pub fn face(&mut self, id: i64, path: &std::path::Path) -> &Slot {
+        if !self.faces.contains_key(&id) {
+            self.request(Request { id, path: path.into(), kind: Kind::Face });
+            self.faces.insert(id, Slot::Pending);
+        }
+        &self.faces[&id]
     }
 
     /// The thumbnail texture if already loaded, without requesting anything.
@@ -191,6 +218,7 @@ fn worker(
             Kind::Thumb if !wanted.lock().expect("wanted lock").contains(&req.id) => Outcome::Skipped,
             Kind::Thumb => to_outcome(cache.get(req.path.as_ref())),
             Kind::Preview => to_outcome(tintype_engine::decode_preview(&req.path, PREVIEW_EDGE)),
+            Kind::Face => to_outcome(tintype_engine::decode_preview(&req.path, FACE_EDGE)),
         };
         if tx.send((req.id, req.kind, outcome)).is_err() {
             return;
@@ -211,6 +239,7 @@ impl std::fmt::Debug for Kind {
         f.write_str(match self {
             Kind::Thumb => "thumb",
             Kind::Preview => "preview",
+            Kind::Face => "face",
         })
     }
 }

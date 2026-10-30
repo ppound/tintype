@@ -8,6 +8,11 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use tintype_engine::{Command, Engine, Event, PhotoRecord, PhotoRef, Response, ScanProgress, Sort};
 
+// The system allocator serializes the many small allocations of parallel image
+// decoding and inference; mimalloc lets face passes scale across cores.
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser)]
 #[command(name = "tintype-cli", version, about = "Index, search and tag your photos")]
 struct Cli {
@@ -77,6 +82,22 @@ enum Cmd {
     Reindex,
     /// Library size and location.
     Stats,
+    /// Find faces in photos not yet analyzed (downloads the face models once, ~39 MB).
+    Faces {
+        /// Photos per batch.
+        #[arg(long, default_value_t = 150)]
+        batch: usize,
+    },
+    /// List named people and unnamed groups of similar faces.
+    People,
+    /// Name faces (ids from `people` or `show-faces`), creating the person if new.
+    Name {
+        name: String,
+        #[arg(required = true)]
+        faces: Vec<i64>,
+    },
+    /// List the faces found in a photo.
+    ShowFaces { photo: String },
     /// Read JSON commands from stdin, one per line; write one JSON response per line.
     Exec,
 }
@@ -121,6 +142,10 @@ fn main() -> Result<()> {
         Cmd::Reindex => Command::Reindex,
         Cmd::Stats => Command::Stats,
         Cmd::Exec => return exec(&mut engine),
+        Cmd::Faces { batch } => return find_faces(&mut engine, batch, cli.json),
+        Cmd::People => Command::People,
+        Cmd::Name { name, faces } => Command::NameFaces { faces, name },
+        Cmd::ShowFaces { photo } => Command::PhotoFaces { photo: photo_ref(&photo) },
     };
 
     let response = engine.execute(cmd, &mut progress)?;
@@ -154,9 +179,44 @@ fn progress(event: Event) {
             format!("reading metadata {done}/{total}")
         }
         Event::Reindex { done, total } => format!("indexing {done}/{total}"),
+        Event::Download { model, done, total } => {
+            format!("downloading {model}: {:.0}%", done as f64 * 100.0 / total.max(1) as f64)
+        }
+        Event::Faces { done, total } => format!("finding faces {done}/{total}"),
     };
     let _ = write!(err, "\r\x1b[2K{line}");
     let _ = err.flush();
+}
+
+/// Runs face batches until every photo has been analyzed.
+fn find_faces(engine: &mut Engine, batch: usize, json: bool) -> Result<()> {
+    let started = std::time::Instant::now();
+    let (mut photos, mut faces, mut failed) = (0, 0, 0);
+    loop {
+        let Response::Faces(r) = engine.execute(Command::FindFaces { batch }, &mut progress)? else {
+            unreachable!("FindFaces answers with Faces")
+        };
+        (photos, faces, failed) = (photos + r.processed, faces + r.faces, failed + r.failed);
+        if std::io::stderr().is_terminal() {
+            eprint!("\r\x1b[2K{photos} photos analyzed, {faces} faces, {} to go", r.remaining);
+        }
+        if r.remaining == 0 || r.cancelled || r.processed == 0 {
+            break;
+        }
+    }
+    if std::io::stderr().is_terminal() {
+        eprint!("\r\x1b[2K");
+    }
+    let secs = started.elapsed().as_secs_f64();
+    if json {
+        println!("{}", serde_json::json!({ "photos": photos, "faces": faces, "failed": failed, "seconds": secs }));
+    } else {
+        println!("{photos} photos analyzed in {secs:.1}s: {faces} faces found");
+        if failed > 0 {
+            println!("{failed} photos could not be decoded (no preview support for their format yet)");
+        }
+    }
+    Ok(())
 }
 
 fn exec(engine: &mut Engine) -> Result<()> {
@@ -221,6 +281,48 @@ fn print_response(response: &Response) {
         }
         Response::Photo(p) => print_photo(p),
         Response::Reindexed { photos } => println!("indexed {photos} photos"),
+        Response::Faces(r) => println!("{} photos analyzed, {} faces, {} to go", r.processed, r.faces, r.remaining),
+        Response::People { people, groups, unscanned, .. } => {
+            if people.is_empty() {
+                println!("No named people yet.");
+            }
+            for p in people {
+                let suggested = if p.suggested > 0 { format!(" (+{} suggested)", p.suggested) } else { String::new() };
+                println!("{:>5}  {}: {} faces{suggested} in {} photos", p.id, p.name, p.faces, p.photos);
+            }
+            if !groups.is_empty() {
+                println!("\nUnnamed groups (name one with `tintype-cli name NAME FACE...`):");
+                for g in groups.iter().take(30) {
+                    let ids: Vec<String> = g.faces.iter().take(8).map(|f| f.to_string()).collect();
+                    println!("  {} faces: {}{}", g.size, ids.join(" "), if g.size > 8 { " ..." } else { "" });
+                }
+                if groups.len() > 30 {
+                    println!("  ... and {} more groups", groups.len() - 30);
+                }
+            }
+            if *unscanned > 0 {
+                println!("\n{unscanned} photos not yet analyzed; run `tintype-cli faces`.");
+            }
+        }
+        Response::FaceList { faces } => {
+            for f in faces {
+                let who = match (&f.person, f.confirmed) {
+                    (Some(n), true) => n.clone(),
+                    (Some(n), false) => format!("{n}?"),
+                    (None, _) => "unknown".into(),
+                };
+                let [x, y, w, h] = f.bbox;
+                println!(
+                    "{:>7}  {who:<20} at {:.0}%,{:.0}% size {:.0}%x{:.0}%",
+                    f.id,
+                    x * 100.0,
+                    y * 100.0,
+                    w * 100.0,
+                    h * 100.0
+                );
+            }
+        }
+        Response::Changed { photos } => println!("updated {photos} photos"),
         Response::Stats(s) => {
             println!("library  {}", s.library);
             println!("photos   {}", s.photos);
@@ -264,6 +366,8 @@ fn print_photo(p: &PhotoRecord) {
     row("gps", m.gps.map(|g| format!("{:.6}, {:.6}", g.lat, g.lon)));
     row("rating", p.rating.map(|r| "★".repeat(r.into())));
     row("tags", (!p.tags.is_empty()).then(|| p.tags.join(", ")));
+    row("faces", (p.faces > 0).then(|| p.faces.to_string()));
+    row("people", (!p.people.is_empty()).then(|| p.people.join(", ")));
     row("hash", p.hash.clone());
     row("error", p.error.clone());
     if !m.fields.is_empty() {

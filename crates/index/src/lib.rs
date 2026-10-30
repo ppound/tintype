@@ -13,6 +13,7 @@
 //! | `year:[2019 TO 2021]`       | inclusive range                            |
 //! | `camera:"/Canon"`           | facet (and everything below it)            |
 //! | `rating:>=4 tag:family`     | the user's own metadata                    |
+//! | `person:alice` `faces:>=3`  | people (named faces) and face count         |
 //! | `gps:true`                  | has location                               |
 
 use std::path::{Component, Path};
@@ -26,12 +27,12 @@ use tantivy::{DateTime, DocAddress, Index, IndexReader, IndexWriter, Order, Relo
 use tintype_catalog::PhotoRecord;
 
 /// Bump whenever the schema or the way documents are built changes.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 const VERSION_FILE: &str = "tintype-schema-version";
 const WRITER_HEAP_BYTES: usize = 128 * 1024 * 1024;
 
 /// Facet fields that [`PhotoIndex::facets`] accepts.
-pub const FACET_FIELDS: &[&str] = &["camera", "lenses", "date", "ext", "tags", "folder"];
+pub const FACET_FIELDS: &[&str] = &["camera", "lenses", "date", "ext", "tags", "people", "folder"];
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -87,11 +88,13 @@ struct Fields {
     model: Field,
     lens: Field,
     tag: Field,
+    person: Field,
     camera: Field,
     lenses: Field,
     date: Field,
     ext: Field,
     tags: Field,
+    people: Field,
     folder: Field,
     taken: Field,
     year: Field,
@@ -105,6 +108,7 @@ struct Fields {
     height: Field,
     size: Field,
     gps: Field,
+    faces: Field,
 }
 
 fn schema() -> (Schema, Fields) {
@@ -120,11 +124,13 @@ fn schema() -> (Schema, Fields) {
         model: b.add_text_field("model", TEXT),
         lens: b.add_text_field("lens", TEXT),
         tag: b.add_text_field("tag", TEXT),
+        person: b.add_text_field("person", TEXT),
         camera: b.add_facet_field("camera", facet.clone()),
         lenses: b.add_facet_field("lenses", facet.clone()),
         date: b.add_facet_field("date", facet.clone()),
         ext: b.add_facet_field("ext", facet.clone()),
         tags: b.add_facet_field("tags", facet.clone()),
+        people: b.add_facet_field("people", facet.clone()),
         folder: b.add_facet_field("folder", facet),
         taken: b.add_date_field("taken", num.clone()),
         year: b.add_u64_field("year", num.clone()),
@@ -137,7 +143,8 @@ fn schema() -> (Schema, Fields) {
         width: b.add_u64_field("width", num.clone()),
         height: b.add_u64_field("height", num.clone()),
         size: b.add_u64_field("size", num.clone()),
-        gps: b.add_bool_field("gps", num),
+        gps: b.add_bool_field("gps", num.clone()),
+        faces: b.add_u64_field("faces", num),
     };
     (b.build(), fields)
 }
@@ -347,6 +354,13 @@ impl PhotoIndex {
             text.push(tag);
         }
 
+        for name in &rec.people {
+            doc.add_text(f.person, name);
+            doc.add_facet(f.people, Facet::from_path([name]));
+            text.push(name);
+        }
+        doc.add_u64(f.faces, rec.faces.into());
+
         text.extend(m.fields.values().map(String::as_str));
         for s in
             [&m.make, &m.model, &m.lens, &m.software, &m.artist, &m.copyright, &m.description].into_iter().flatten()
@@ -379,6 +393,8 @@ mod tests {
             error: None,
             rating: None,
             tags: Vec::new(),
+            people: Vec::new(),
+            faces: 0,
             indexed_at: 0,
         }
     }
@@ -404,6 +420,8 @@ mod tests {
         };
         let mut beach = rec(2, "/photos/2021/beach/DSC_0002.NEF", nikon);
         beach.rating = Some(5);
+        beach.people = vec!["Ada Lovelace".into()];
+        beach.faces = 3;
         beach.tags = vec!["family".into(), "beach".into()];
 
         let mut idx = PhotoIndex::in_memory().unwrap();
@@ -435,6 +453,9 @@ mod tests {
         assert_eq!(ids(&idx, "rating:>=4 tag:family"), vec![2]);
         assert_eq!(ids(&idx, "beach"), vec![2], "tag and folder both match, one hit");
         assert_eq!(ids(&idx, "gps:true"), vec![1]);
+        assert_eq!(ids(&idx, "person:ada"), vec![2]);
+        assert_eq!(ids(&idx, "lovelace faces:>=2"), vec![2]);
+        assert_eq!(ids(&idx, "people:\"/Ada Lovelace\""), vec![2]);
         assert_eq!(ids(&idx, "zoo"), vec![1], "path components are searchable");
         assert_eq!(ids(&idx, "camera:\"/Canon\""), vec![1]);
         assert_eq!(ids(&idx, "canon nikon"), Vec::<i64>::new(), "terms are ANDed");

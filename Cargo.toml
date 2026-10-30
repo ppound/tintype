@@ -34,17 +34,21 @@ dunce = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "tiff"] }
 imagesize = "0.15"
 jpeg-decoder = { version = "0.3", default-features = false }
+mimalloc = "0.1"
 kamadak-exif = "0.6"
 rayon = "1.12"
 rfd = "0.17"
 rusqlite = { version = "0.41", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 tantivy = "0.27"
+tract-onnx = "0.23"
 tempfile = "3"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ureq = "3"
 walkdir = "2.5"
 
 [profile.dev.package."*"]
