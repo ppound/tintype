@@ -1,0 +1,18 @@
+[package]
+name = "tintype-meta"
+description = "Photo metadata extraction (EXIF) in pure Rust"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+chrono.workspace = true
+imagesize.workspace = true
+kamadak-exif.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tintype-testkit.workspace = true

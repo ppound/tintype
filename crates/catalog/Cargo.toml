@@ -1,0 +1,17 @@
+[package]
+name = "tintype-catalog"
+description = "The photo library's source of truth, stored in SQLite"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tintype-meta.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

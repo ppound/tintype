@@ -1,0 +1,9 @@
+[package]
+name = "tintype-codecs"
+description = "Image decoding, thumbnails and RAW embedded previews"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]

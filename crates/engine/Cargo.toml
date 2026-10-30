@@ -1,0 +1,22 @@
+[package]
+name = "tintype-engine"
+description = "Command registry: every UI, CLI and automation action goes through here"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+directories.workspace = true
+dunce.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tintype-catalog.workspace = true
+tintype-index.workspace = true
+tintype-jobs.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true
+tintype-testkit.workspace = true

@@ -1,0 +1,50 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "apps/*", "xtask"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+publish = false
+
+[workspace.dependencies]
+# Internal crates. Layering is enforced by `cargo xtask layers`.
+tintype-meta = { path = "crates/meta" }
+tintype-codecs = { path = "crates/codecs" }
+tintype-infer = { path = "crates/infer" }
+tintype-catalog = { path = "crates/catalog" }
+tintype-index = { path = "crates/index" }
+tintype-analyze = { path = "crates/analyze" }
+tintype-faces = { path = "crates/faces" }
+tintype-jobs = { path = "crates/jobs" }
+tintype-engine = { path = "crates/engine" }
+tintype-testkit = { path = "crates/testkit" }
+
+# External.
+anyhow = "1"
+blake3 = "1.8"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+clap = { version = "4.6", features = ["derive", "env"] }
+directories = "6"
+dunce = "1"
+imagesize = "0.15"
+kamadak-exif = "0.6"
+rayon = "1.12"
+rusqlite = { version = "0.41", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tantivy = "0.27"
+tempfile = "3"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+walkdir = "2.5"
+
+[profile.dev.package."*"]
+# Dependencies (sqlite, tantivy, exif parsing) are slow unoptimized; our own code stays debuggable.
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
