@@ -3,13 +3,14 @@
 //! scripts) all go through [`Engine::execute`], so they behave identically.
 //! Commands and responses are serde types, so they can travel as JSON.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 use tintype_analyze::{ANALYSIS_VERSION, ImageEncoder, TextEncoder};
-use tintype_catalog::Catalog;
+use tintype_catalog::{Catalog, StackPlace};
 use tintype_faces::{FACES_VERSION, FaceAnalyzer};
 use tintype_index::PhotoIndex;
 use tintype_infer::{ModelSpec, ModelStore, SFACE, SIGLIP_TEXT, SIGLIP_TOKENIZER, SIGLIP_VISION, YUNET};
@@ -76,6 +77,10 @@ pub enum Command {
         /// Results are ranked by similarity; `sort` is ignored.
         #[serde(default)]
         smart: bool,
+        /// Show one photo per stack (copies, versions and bursts of one shot),
+        /// with `stack_size` saying how many of its photos matched.
+        #[serde(default = "yes")]
+        stacks: bool,
         #[serde(default)]
         sort: Sort,
         #[serde(default = "default_limit")]
@@ -266,6 +271,9 @@ const SMART_MIN_PROBABILITY: f32 = 0.0003;
 /// 4,253-photo library by checking results at increasing depth.
 const SMART_WINDOW: f32 = 0.045;
 
+/// Library setting: the stacking rules (`tintype_jobs::STACKS_VERSION`) last applied.
+const STACKS_SETTING: &str = "stacks.version";
+
 /// Library setting: write XMP sidecars ("1", the default) or only read them ("0").
 const WRITE_SIDECARS: &str = "sidecars.write";
 
@@ -288,6 +296,8 @@ pub struct Engine {
     text_encoder: Option<TextEncoder>,
     /// All image embeddings, loaded on the first smart search after a change.
     embeddings: Option<Vec<(i64, Vec<f32>)>>,
+    /// Every stacked photo's place, loaded on the first stacked search after a change.
+    stack_places: Option<HashMap<i64, StackPlace>>,
 }
 
 impl Engine {
@@ -311,11 +321,18 @@ impl Engine {
             image_encoder: None,
             text_encoder: None,
             embeddings: None,
+            stack_places: None,
         };
         if fresh || engine.index.doc_count() != engine.catalog.count()? {
             tracing::info!(fresh, "rebuilding search index");
             engine.reindex(&mut |_| {})?;
-        } else {
+        }
+        if engine.catalog.setting(STACKS_SETTING)?.as_deref() != Some(&tintype_jobs::STACKS_VERSION.to_string()) {
+            tracing::info!("stacking the library");
+            engine.restack()?;
+            engine.catalog.set_setting(STACKS_SETTING, &tintype_jobs::STACKS_VERSION.to_string())?;
+        }
+        {
             // Finish what an interrupted scan or sidecar import left behind.
             let pending = engine.catalog.index_pending()?;
             if !pending.is_empty() {
@@ -358,13 +375,14 @@ impl Engine {
                 }
                 self.scan(&roots, hash, events).map(Response::Scan)
             }
-            Command::Search { query, smart: true, limit, offset, .. }
-                if !tintype_index::split_smart(&query).1.is_empty() =>
-            {
-                self.smart_search(&query, limit, offset, events).map(Response::Search)
-            }
-            Command::Search { query, sort, limit, offset, .. } => {
-                Ok(Response::Search(self.index.search(&query, sort, limit, offset)?))
+            Command::Search { query, smart, sort, limit, offset, stacks } => {
+                let smart = smart && !tintype_index::split_smart(&query).1.is_empty();
+                if !smart && !stacks {
+                    return Ok(Response::Search(self.index.search(&query, sort, limit, offset)?));
+                }
+                let ordered =
+                    if smart { self.smart_ranked(&query, events)? } else { self.index.ordered_ids(&query, sort)? };
+                self.page(ordered, stacks, limit, offset).map(Response::Search)
             }
             Command::Facets { field, query, parent } => {
                 Ok(Response::Facets { counts: self.index.facets(&query, &field, &parent)? })
@@ -385,6 +403,11 @@ impl Engine {
                 self.before_edit(&[id])?;
                 self.catalog.set_rating(id, rating)?;
                 self.after_edit(&[id])?;
+                let moved = tintype_jobs::refresh_cover(&mut self.catalog, id)?;
+                if !moved.is_empty() {
+                    self.stack_places = None;
+                    self.reindex_photos(moved)?;
+                }
                 self.refresh(id)
             }
             Command::Tag { photo, add, remove } => {
@@ -541,18 +564,16 @@ impl Engine {
         let report = tintype_jobs::analyze(&mut self.catalog, &encoder, batch.max(1), &self.cancel, &mut progress)?;
         if report.processed > 0 {
             self.embeddings = None;
+            // Bursts are found by looks: stack again once a pass ends.
+            if report.remaining == 0 || report.cancelled {
+                self.restack()?;
+            }
         }
         Ok(report)
     }
 
     /// Ranks photos that pass the query's field terms by how well they match its words.
-    fn smart_search(
-        &mut self,
-        query: &str,
-        limit: usize,
-        offset: usize,
-        events: &mut dyn FnMut(Event),
-    ) -> Result<SearchResults> {
+    fn smart_ranked(&mut self, query: &str, events: &mut dyn FnMut(Event)) -> Result<Vec<i64>> {
         let (filters, words) = tintype_index::split_smart(query);
         let target = self.text_encoder(events)?.embed_query(&words)?;
         let allowed = self.index.matching_ids(&filters)?;
@@ -561,9 +582,37 @@ impl Engine {
         }
         let min = tintype_analyze::similarity_for_probability(SMART_MIN_PROBABILITY);
         let scored = rank(self.embeddings.as_deref().unwrap_or_default(), &allowed, &target, min, SMART_WINDOW);
-        let page: Vec<i64> = scored.iter().skip(offset).take(limit).map(|(_, id)| *id).collect();
-        let hits = self.catalog.paths(&page)?.into_iter().map(|(id, path)| Hit { id, path }).collect();
-        Ok(SearchResults { total: scored.len(), hits })
+        Ok(scored.into_iter().map(|(_, id)| id).collect())
+    }
+
+    /// One page of `ordered` results, stacked if asked.
+    fn page(&mut self, ordered: Vec<i64>, stacks: bool, limit: usize, offset: usize) -> Result<SearchResults> {
+        let entries = if stacks {
+            if self.stack_places.is_none() {
+                self.stack_places = Some(self.catalog.stack_places()?);
+            }
+            collapse(&ordered, self.stack_places.as_ref().expect("loaded above"))
+        } else {
+            ordered.iter().map(|&id| (id, None, 1)).collect()
+        };
+        let page = &entries[offset.min(entries.len())..(offset.saturating_add(limit)).min(entries.len())];
+        let ids: Vec<i64> = page.iter().map(|e| e.0).collect();
+        let paths: HashMap<i64, String> = self.catalog.paths(&ids)?.into_iter().collect();
+        let hits = page
+            .iter()
+            .filter_map(|&(id, stack, stack_size)| {
+                paths.get(&id).map(|path| Hit { id, path: path.clone(), stack, stack_size })
+            })
+            .collect();
+        Ok(SearchResults { total: entries.len(), hits })
+    }
+
+    /// Groups the whole library into stacks again.
+    fn restack(&mut self) -> Result<()> {
+        let changed = tintype_jobs::restack(&mut self.catalog)?;
+        self.stack_places = None;
+        self.reindex_photos(changed)?;
+        Ok(())
     }
 
     fn find_faces(&mut self, batch: usize, events: &mut dyn FnMut(Event)) -> Result<FacesReport> {
@@ -632,6 +681,9 @@ impl Engine {
         }
         self.index.commit()?;
         self.catalog.clear_index_pending(Some(&report.changed_ids))?;
+        if report.added + report.updated + report.removed + report.moved > 0 {
+            self.restack()?;
+        }
         Ok(report)
     }
 
@@ -693,6 +745,35 @@ impl Engine {
     }
 }
 
+/// One entry per stack in `ordered` (at the position of its first match),
+/// shown by its cover if the cover matched; unstacked photos pass through.
+/// Entries are (photo, stack, matching photos in the stack).
+fn collapse(ordered: &[i64], places: &HashMap<i64, StackPlace>) -> Vec<(i64, Option<i64>, u32)> {
+    let mut matched: HashMap<i64, (u32, Option<i64>)> = HashMap::new();
+    for id in ordered {
+        if let Some(p) = places.get(id) {
+            let e = matched.entry(p.stack).or_default();
+            e.0 += 1;
+            if p.cover {
+                e.1 = Some(*id);
+            }
+        }
+    }
+    let mut seen = HashSet::new();
+    let mut out = Vec::with_capacity(ordered.len());
+    for &id in ordered {
+        match places.get(&id) {
+            None => out.push((id, None, 1)),
+            Some(p) if seen.insert(p.stack) => {
+                let (n, cover) = matched[&p.stack];
+                out.push((cover.unwrap_or(id), Some(p.stack), n));
+            }
+            Some(_) => {}
+        }
+    }
+    out
+}
+
 /// Photos in `allowed` (sorted ids) whose embedding is at least `min` similar
 /// to `target` and within `window` of the best, best first, as (similarity, id).
 fn rank(embeddings: &[(i64, Vec<f32>)], allowed: &[i64], target: &[f32], min: f32, window: f32) -> Vec<(f32, i64)> {
@@ -715,7 +796,14 @@ mod tests {
     use tintype_testkit::JpegSpec;
 
     fn hits(engine: &mut Engine, query: &str) -> Vec<String> {
-        let cmd = Command::Search { query: query.into(), smart: false, sort: Sort::Newest, limit: 50, offset: 0 };
+        let cmd = Command::Search {
+            query: query.into(),
+            smart: false,
+            stacks: false,
+            sort: Sort::Newest,
+            limit: 50,
+            offset: 0,
+        };
         let Response::Search(r) = engine.execute(cmd, &mut |_| {}).unwrap() else { panic!() };
         r.hits.into_iter().map(|h| Path::new(&h.path).file_name().unwrap().to_string_lossy().into_owned()).collect()
     }
@@ -785,7 +873,14 @@ mod tests {
         let mut engine = Engine::open(lib.path()).unwrap();
         engine.execute(Command::Scan { roots: vec![photos.path().into()], hash: false }, &mut |_| {}).unwrap();
         // No description words: no models are needed.
-        let cmd = Command::Search { query: "iso:>=1000".into(), smart: true, sort: Sort::Newest, limit: 5, offset: 0 };
+        let cmd = Command::Search {
+            query: "iso:>=1000".into(),
+            smart: true,
+            stacks: true,
+            sort: Sort::Newest,
+            limit: 5,
+            offset: 0,
+        };
         let Response::Search(r) = engine.execute(cmd, &mut |_| {}).unwrap() else { panic!() };
         assert_eq!(r.total, 1);
         let Response::Stats(stats) = engine.execute(Command::Stats, &mut |_| {}).unwrap() else { panic!() };
@@ -847,6 +942,48 @@ mod tests {
 
         let mut engine = Engine::open(lib.path()).unwrap();
         assert_eq!(hits(&mut engine, "tag:barn"), vec!["a.jpg"]);
+    }
+
+    #[test]
+    fn collapse_shows_one_per_stack() {
+        let places: HashMap<i64, StackPlace> = [
+            (2, StackPlace { stack: 2, cover: false }),
+            (3, StackPlace { stack: 2, cover: true }),
+            (5, StackPlace { stack: 5, cover: true }),
+            (6, StackPlace { stack: 5, cover: false }),
+        ]
+        .into();
+        // 6 matched but its cover 5 didn't: 6 stands in for the stack.
+        assert_eq!(
+            collapse(&[1, 2, 4, 3, 6], &places),
+            vec![(1, None, 1), (3, Some(2), 2), (4, None, 1), (6, Some(5), 1)]
+        );
+    }
+
+    #[test]
+    fn raw_and_jpg_of_one_shot_stack() {
+        let photos = tempfile::tempdir().unwrap();
+        // Same camera and second: a "RAF" (same bytes, different name) and its JPG.
+        JpegSpec::canon().write(&photos.path().join("IMG_1.JPG"));
+        std::fs::copy(photos.path().join("IMG_1.JPG"), photos.path().join("IMG_1-edit.jpg")).unwrap();
+        JpegSpec::nikon().write(&photos.path().join("other.jpg"));
+        let lib = tempfile::tempdir().unwrap();
+        let mut engine = Engine::open(lib.path()).unwrap();
+        engine.execute(Command::Scan { roots: vec![photos.path().into()], hash: true }, &mut |_| {}).unwrap();
+
+        let stacked = Command::Search {
+            query: String::new(),
+            smart: false,
+            stacks: true,
+            sort: Sort::Newest,
+            limit: 10,
+            offset: 0,
+        };
+        let Response::Search(r) = engine.execute(stacked, &mut |_| {}).unwrap() else { panic!() };
+        assert_eq!(r.total, 2);
+        let stack = r.hits.iter().find(|h| h.stack_size == 2).expect("a stack of two").stack.unwrap();
+        assert_eq!(hits(&mut engine, &format!("stack:{stack}")).len(), 2, "the stack opens with stack:<id>");
+        assert_eq!(hits(&mut engine, "").len(), 3, "unstacked shows all");
     }
 
     #[test]

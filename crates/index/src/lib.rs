@@ -14,6 +14,7 @@
 //! | `camera:"/Canon"`           | facet (and everything below it)            |
 //! | `rating:>=4 tag:family`     | the user's own metadata                    |
 //! | `person:alice` `faces:>=3`  | people (named faces) and face count         |
+//! | `stack:12`                  | the photos of one stack                    |
 //! | `gps:true`                  | has location                               |
 //!
 //! Smart (semantic) search is done by the engine: [`split_smart`] separates
@@ -31,7 +32,7 @@ use tantivy::{DateTime, DocAddress, Index, IndexReader, IndexWriter, Order, Relo
 use tintype_catalog::PhotoRecord;
 
 /// Bump whenever the schema or the way documents are built changes.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 const VERSION_FILE: &str = "tintype-schema-version";
 const WRITER_HEAP_BYTES: usize = 128 * 1024 * 1024;
 
@@ -69,6 +70,11 @@ pub enum Sort {
 pub struct Hit {
     pub id: i64,
     pub path: String,
+    /// The stack this hit stands for, when results are stacked...
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stack: Option<i64>,
+    /// ...and how many of its photos matched (1 when not stacked).
+    pub stack_size: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -115,6 +121,7 @@ struct Fields {
     size: Field,
     gps: Field,
     faces: Field,
+    stack: Field,
 }
 
 fn schema() -> (Schema, Fields) {
@@ -150,7 +157,8 @@ fn schema() -> (Schema, Fields) {
         height: b.add_u64_field("height", num.clone()),
         size: b.add_u64_field("size", num.clone()),
         gps: b.add_bool_field("gps", num.clone()),
-        faces: b.add_u64_field("faces", num),
+        faces: b.add_u64_field("faces", num.clone()),
+        stack: b.add_u64_field("stack", num),
     };
     (b.build(), fields)
 }
@@ -259,6 +267,34 @@ impl PhotoIndex {
         Ok(SearchResults { total, hits })
     }
 
+    /// Ids of every photo matching `query`, in `sort` order.
+    pub fn ordered_ids(&self, query: &str, sort: Sort) -> Result<Vec<i64>> {
+        let query = self.parse(query)?;
+        let searcher = self.reader.searcher();
+        let total = searcher.search(&query, &Count)?;
+        if total == 0 {
+            return Ok(Vec::new());
+        }
+        let top = TopDocs::with_limit(total);
+        let addrs: Vec<DocAddress> = match sort {
+            Sort::Relevance => searcher.search(&query, &top.order_by_score())?.into_iter().map(|(_, a)| a).collect(),
+            Sort::Newest | Sort::Oldest => {
+                let order = if sort == Sort::Newest { Order::Desc } else { Order::Asc };
+                let collector = top.order_by_fast_field::<DateTime>("taken", order);
+                searcher.search(&query, &collector)?.into_iter().map(|(_, a)| a).collect()
+            }
+        };
+        let mut columns = Vec::new();
+        for segment in searcher.segment_readers() {
+            columns.push(segment.fast_fields().u64("id")?);
+        }
+        Ok(addrs
+            .into_iter()
+            .filter_map(|a| columns[a.segment_ord as usize].first(a.doc_id))
+            .map(|id| id as i64)
+            .collect())
+    }
+
     /// Ids of every photo matching `query`.
     pub fn matching_ids(&self, query: &str) -> Result<Vec<i64>> {
         let searcher = self.reader.searcher();
@@ -298,7 +334,7 @@ impl PhotoIndex {
         let doc: TantivyDocument = searcher.doc(addr)?;
         let id = doc.get_first(self.fields.id).and_then(|v| v.as_u64()).unwrap_or_default() as i64;
         let path = doc.get_first(self.fields.path).and_then(|v| v.as_str()).unwrap_or_default().to_string();
-        Ok(Hit { id, path })
+        Ok(Hit { id, path, stack: None, stack_size: 1 })
     }
 
     fn document(&self, rec: &PhotoRecord) -> TantivyDocument {
@@ -379,6 +415,9 @@ impl PhotoIndex {
             text.push(name);
         }
         doc.add_u64(f.faces, rec.faces.into());
+        if let Some(stack) = rec.stack {
+            doc.add_u64(f.stack, stack as u64);
+        }
 
         text.extend(m.fields.values().map(String::as_str));
         for s in
@@ -469,6 +508,8 @@ mod tests {
             tags: Vec::new(),
             people: Vec::new(),
             faces: 0,
+            stack: None,
+            stack_cover: false,
             indexed_at: 0,
         }
     }
@@ -554,6 +595,14 @@ mod tests {
             (r#"year:2024 camera:"/FUJIFILM/X-T5" focal:[70 TO 200] -tag:x"#.into(), "dog on a beach".into())
         );
         assert_eq!(split(":) smile"), ("".into(), ":) smile".into()));
+    }
+
+    #[test]
+    fn ordered_ids_follow_sort() {
+        let idx = sample();
+        assert_eq!(idx.ordered_ids("", Sort::Newest).unwrap()[..2], [1, 2]);
+        assert_eq!(idx.ordered_ids("", Sort::Oldest).unwrap()[0], 2);
+        assert_eq!(idx.ordered_ids("canon", Sort::Relevance).unwrap(), vec![1]);
     }
 
     #[test]

@@ -3,8 +3,8 @@
 Index, search and tag your photo library. One binary, no Java, Docker, WSL2 or
 Python. A Rust rewrite of [PhotoStat](https://github.com/ppound/photostat).
 
-Status: indexing, search, the desktop app, face recognition and smart
-(semantic) search work. Auto-tags and near-duplicates are next (see [Roadmap](#roadmap)).
+Status: indexing, search, the desktop app, face recognition, smart (semantic)
+search and duplicate stacking work. Packaging is next (see [Roadmap](#roadmap)).
 
 ## Desktop app
 
@@ -18,6 +18,9 @@ never changes, moves or deletes a photo. You get:
 - a search bar (same syntax as below), with facet filters for camera, lens,
   date, tags, file type and folder in the sidebar
 - a thumbnail grid. Size it with the slider; arrow keys move the selection.
+- **stacks**: copies, versions and burst frames of one shot show as one photo with a
+  count badge (the best rated, else the largest, else the latest edit). Click the badge,
+  or **Show all** in the details, to see them all. Nothing on disk changes.
 - a full-size view: double-click or Enter to open, ← → to browse, Esc to go back
 - details, a 1–5 star rating (or keys 0–5) and tags for the selected photo
 - **Rescan** to pick up new, changed and removed files in all your folders
@@ -51,7 +54,24 @@ and keeps everything else in an existing sidecar as it was.
   Turning it back on writes everything edited in the meantime.
 
 Moving or renaming photos inside your folders keeps everything Tintype knows
-about them: a rescan recognizes a file by its content. The first
+about them: a rescan recognizes a file by its content.
+
+### Stacks
+
+Photos are stacked when they are one shot in several files, tuned on a real
+4,253-photo RAF + JPG library:
+
+| Kind | Rule |
+|------|------|
+| Exact copies | same content hash |
+| RAW + JPEG, edits, exports | same camera model, same capture second (exports that drop the serial number still match; two bodies with different serials never do) |
+| Bursts | same body, at most 10 s apart and 0.93+ similar (SigLIP) |
+| Repeats of one frame | same body, at most 60 s apart and 0.97+ similar |
+| Copies with no capture time | 0.96+ similar to another photo |
+
+Looks alone never stack photos taken at different times: the same view at sunrise
+and sunset scores as alike as an edit. A stack of bursts spans at most a minute.
+Bursts and repeats need **Analyze photos** (smart search) to have run. The first
 run downloads two small open models (YuNet, MIT; SFace, Apache-2.0; 39 MB in
 total), verified by SHA-256. Smart search downloads Google's SigLIP B/16
 (Apache-2.0, 815 MB) the first time.
@@ -61,7 +81,7 @@ total), verified by SHA-256. Smart search downloads Google's SigLIP B/16
 ```sh
 tintype-cli scan ~/Pictures                 # first scan reads everything
 tintype-cli rescan                          # later scans only read new/changed files
-tintype-cli search beach sunset
+tintype-cli search beach sunset             # one line per stack; --unstacked lists every photo
 tintype-cli search "make:fujifilm iso:>1600" --sort newest
 tintype-cli facets camera                   # counts per make
 tintype-cli facets camera -p FUJIFILM       # drill down to models
@@ -95,6 +115,7 @@ All terms must match.
 | `rating:>=4` `tag:family`      | your own metadata                           |
 | `person:ada` `faces:>=3`       | people (named faces) and number of faces    |
 | `gps:true`                     | photos with a location                      |
+| `stack:12`                     | every photo of one stack                    |
 | `camera:"/FUJIFILM/X-T5"` `ext:/raf` `folder:"/C:/Users/me/Pictures/2024"` | facets |
 
 With `--smart` (the app's **Smart** toggle), terms with a `field:` still filter as
@@ -163,7 +184,7 @@ Tests use synthetic photos from `testkit`; no photo corpus is needed.
 
 `TINTYPE_SCREENSHOT=out.png tintype` runs the app until thumbnails settle, saves
 a screenshot and exits. `TINTYPE_SCREENSHOT_SELECT=<n>` selects a result first,
-`TINTYPE_SCREENSHOT_VIEW=loupe` opens it full size, and
+`TINTYPE_SCREENSHOT_VIEW=loupe` opens it full size (`stack`: opens the first stack), and
 `TINTYPE_SCREENSHOT_SMART="dog on a beach"` runs a smart search.
 
 ## Roadmap
@@ -173,8 +194,8 @@ a screenshot and exits. `TINTYPE_SCREENSHOT_SELECT=<n>` selects a result first,
    Next: RAF sensor dimensions, HEIC and other RAW previews, app icon, paging for very large result sets
 3. ~~Faces: detect, group, name, suggest, merge~~
    Next: faster face passes, HEIC/DNG previews for detection, scaling grouping past ~20k faces
-4. ~~Smart search (SigLIP embeddings)~~
-   Next: near-duplicates (perceptual hash), zero-shot auto-tags, aesthetic score
+4. ~~Smart search (SigLIP embeddings)~~, ~~stacks of duplicates, versions and bursts~~
+   Next: zero-shot auto-tags, aesthetic score
 5. Packaging: MSI, DMG, AppImage from CI
 6. ~~Read and write PhotoStat XMP sidecars~~
    Next: import PhotoStat's JSON data, if any; use `photostat:place`

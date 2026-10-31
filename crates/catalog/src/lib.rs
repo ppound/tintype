@@ -13,8 +13,10 @@ use tintype_meta::PhotoMeta;
 mod embeddings;
 mod faces;
 mod sidecars;
+mod stacks;
 pub use faces::{FaceGroup, FaceInfo, FaceRow, NewFace, Person, Suggestion};
 pub use sidecars::SidecarStamp;
+pub use stacks::{StackCandidate, StackPlace};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -114,6 +116,13 @@ const MIGRATIONS: &[&str] = &[
     -- Photos changed in the catalog whose search index entry may not be updated yet.
     CREATE TABLE index_pending (photo_id INTEGER PRIMARY KEY);
 "#,
+    r#"
+    -- Copies, versions and burst frames of one shot. The stack id is its smallest
+    -- photo id; the cover is the photo shown for the stack.
+    ALTER TABLE photos ADD COLUMN stack INTEGER;
+    ALTER TABLE photos ADD COLUMN stack_cover INTEGER NOT NULL DEFAULT 0;
+    CREATE INDEX photos_stack ON photos(stack);
+"#,
 ];
 
 /// A photo as produced by a scan, before it has an id.
@@ -156,6 +165,9 @@ pub struct PhotoRecord {
     pub people: Vec<String>,
     /// Faces found in this photo.
     pub faces: u32,
+    /// The stack this photo is in, and whether it is the one shown for it.
+    pub stack: Option<i64>,
+    pub stack_cover: bool,
     pub indexed_at: i64,
 }
 
@@ -373,7 +385,8 @@ impl Catalog {
     }
 }
 
-const SELECT_PHOTO: &str = "SELECT id, path, size, mtime_ns, hash, meta, error, rating, indexed_at FROM photos";
+const SELECT_PHOTO: &str =
+    "SELECT id, path, size, mtime_ns, hash, meta, error, rating, indexed_at, stack, stack_cover FROM photos";
 
 /// A row with its metadata JSON not yet parsed (parsing errors aren't rusqlite errors).
 struct RawRecord {
@@ -403,6 +416,8 @@ fn read_row(r: &Row) -> rusqlite::Result<RawRecord> {
             tags: Vec::new(),
             people: Vec::new(),
             faces: 0,
+            stack: r.get(9)?,
+            stack_cover: r.get(10)?,
             indexed_at: r.get(8)?,
         },
         meta_json: r.get(5)?,
@@ -537,17 +552,21 @@ mod tests {
 
     #[test]
     fn verbatim_network_paths_are_rewritten() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("catalog.db");
-        let cat = Catalog::open(&path).unwrap();
-        let mut cat = cat;
-        cat.upsert_many(&[photo(r"\\?\UNC\nas\share\a.jpg", 1), photo(r"C:\b.jpg", 1)]).unwrap();
-        cat.add_roots(&[r"\\?\UNC\nas\share".into()]).unwrap();
-        // Back to the schema before the path fix (and the later index_pending table).
-        cat.conn.execute("DROP TABLE index_pending", []).unwrap();
-        cat.conn.pragma_update(None, "user_version", 7).unwrap();
-        drop(cat);
-        let cat = Catalog::open(&path).unwrap();
+        // A database at schema version 7, written the way older builds did.
+        let conn = Connection::open_in_memory().unwrap();
+        for sql in &MIGRATIONS[..7] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 7).unwrap();
+        for path in [r"\\?\UNC\nas\share\a.jpg", r"C:\b.jpg"] {
+            conn.execute(
+                "INSERT INTO photos (path, size, mtime_ns, meta, indexed_at) VALUES (?1, 1, 1, '{}', 0)",
+                [path],
+            )
+            .unwrap();
+        }
+        conn.execute("INSERT INTO roots (path) VALUES (?1)", [r"\\?\UNC\nas\share"]).unwrap();
+        let cat = Catalog::init(conn).unwrap();
         assert!(cat.get_by_path(r"\\nas\share\a.jpg").unwrap().is_some());
         assert!(cat.get_by_path(r"C:\b.jpg").unwrap().is_some());
         assert_eq!(cat.roots().unwrap(), vec![r"\\nas\share".to_string()]);

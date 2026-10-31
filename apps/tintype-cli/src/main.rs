@@ -49,6 +49,9 @@ enum Cmd {
         /// (run `analyze` first). Field terms still filter; results are ranked by match.
         #[arg(long)]
         smart: bool,
+        /// List every photo instead of one per stack (copies, RAF+JPG pairs, versions, bursts).
+        #[arg(long)]
+        unstacked: bool,
         #[arg(long, value_enum, default_value_t = SortArg::Relevance)]
         sort: SortArg,
         #[arg(short = 'n', long, default_value_t = 20)]
@@ -148,13 +151,13 @@ fn main() -> Result<()> {
     let cmd = match cli.cmd {
         Cmd::Scan { folders, no_hash } => Command::Scan { roots: folders, hash: !no_hash },
         Cmd::Rescan { no_hash } => Command::Rescan { hash: !no_hash },
-        Cmd::Search { query, smart, sort, limit, offset } => {
+        Cmd::Search { query, smart, unstacked, sort, limit, offset } => {
             let sort = match sort {
                 SortArg::Relevance => Sort::Relevance,
                 SortArg::Newest => Sort::Newest,
                 SortArg::Oldest => Sort::Oldest,
             };
-            Command::Search { query: query.join(" "), smart, sort, limit, offset }
+            Command::Search { query: query.join(" "), smart, stacks: !unstacked, sort, limit, offset }
         }
         Cmd::Facets { field, query, parent } => Command::Facets { field, query, parent },
         Cmd::Show { photo } => Command::Show { photo: photo_ref(&photo) },
@@ -327,7 +330,12 @@ fn print_response(response: &Response) {
         }
         Response::Search(r) => {
             for hit in &r.hits {
-                println!("{:>7}  {}", hit.id, hit.path);
+                match hit.stack {
+                    Some(stack) if hit.stack_size > 1 => {
+                        println!("{:>7}  {}  (+{} more: stack:{stack})", hit.id, hit.path, hit.stack_size - 1)
+                    }
+                    _ => println!("{:>7}  {}", hit.id, hit.path),
+                }
             }
             let shown = r.hits.len();
             if shown < r.total {
@@ -442,6 +450,7 @@ fn print_photo(p: &PhotoRecord) {
     row("tags", (!p.tags.is_empty()).then(|| p.tags.join(", ")));
     row("faces", (p.faces > 0).then(|| p.faces.to_string()));
     row("people", (!p.people.is_empty()).then(|| p.people.join(", ")));
+    row("stack", p.stack.map(|s| format!("{s}{}", if p.stack_cover { " (shown for the stack)" } else { "" })));
     row("hash", p.hash.clone());
     row("error", p.error.clone());
     if !m.fields.is_empty() {

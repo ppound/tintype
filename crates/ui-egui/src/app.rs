@@ -109,6 +109,8 @@ pub struct TintypeApp {
     smart: SmartState,
     /// Photo to open once the next search returns (from a face on the People tab).
     pending_open: Option<i64>,
+    /// The stack being shown in full: (stack id, photos in it).
+    open_stack: Option<(i64, u32)>,
 
     query: String,
     /// The search box's widget id, for focusing it with Ctrl+F.
@@ -163,6 +165,7 @@ impl TintypeApp {
             people: PeopleState::default(),
             smart: SmartState::default(),
             pending_open: None,
+            open_stack: None,
             query: String::new(),
             search_box: None,
             query_error: None,
@@ -215,7 +218,16 @@ impl TintypeApp {
         for (field, path) in &self.filters {
             q.push_str(&format!(" {field}:\"{}\"", path.replace('"', "\\\"")));
         }
+        if let Some((stack, _)) = self.open_stack {
+            q.push_str(&format!(" stack:{stack}"));
+        }
         q
+    }
+
+    /// Shows every photo of a stack (`None`: back to one photo per stack).
+    fn open_stack(&mut self, stack: Option<(i64, u32)>) {
+        self.open_stack = stack;
+        self.search();
     }
 
     /// What facet counts are taken over: in smart mode the words rank rather
@@ -230,6 +242,7 @@ impl TintypeApp {
         let cmd = Command::Search {
             query: self.full_query(),
             smart: self.settings.smart,
+            stacks: self.open_stack.is_none(),
             sort: self.settings.sort,
             limit: SEARCH_LIMIT,
             offset: 0,
@@ -574,6 +587,19 @@ impl TintypeApp {
             ui.colored_label(ui.visuals().error_fg_color, err);
         }
         self.smart_banner(ui);
+        if let Some((_, n)) = self.open_stack {
+            let mut close = false;
+            ui.horizontal(|ui| {
+                ui.weak("Showing");
+                close = ui
+                    .button(format!("All {n} photos of a stack  ×"))
+                    .on_hover_text("Back to one photo per stack")
+                    .clicked();
+            });
+            if close {
+                self.open_stack(None);
+            }
+        }
         if !self.filters.is_empty() {
             let mut remove = None;
             let mut clear = false;
@@ -727,6 +753,7 @@ impl TintypeApp {
         let mut new_rating = None;
         let mut add_tag = None;
         let mut remove_tag = None;
+        let mut open_stack = None;
 
         ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
             ui.add_space(8.0);
@@ -738,6 +765,15 @@ impl TintypeApp {
             }
             if ui.small_button("Copy path").clicked() {
                 ui.ctx().copy_text(p.path.clone());
+            }
+            let hit = self.selected.and_then(|i| self.results.get(i)).filter(|h| h.id == p.id);
+            if let Some((stack, n)) = hit.and_then(|h| h.stack.map(|s| (s, h.stack_size))).filter(|(_, n)| *n > 1) {
+                ui.horizontal(|ui| {
+                    ui.label(format!("One of {n} copies, versions or burst frames."));
+                    if ui.link("Show all").clicked() {
+                        open_stack = Some((stack, n));
+                    }
+                });
             }
 
             ui.add_space(6.0);
@@ -828,6 +864,9 @@ impl TintypeApp {
             });
         });
 
+        if let Some(stack) = open_stack {
+            self.open_stack(Some(stack));
+        }
         if let Some(r) = new_rating {
             self.rate(p.id, r);
         }
@@ -930,13 +969,48 @@ impl TintypeApp {
                 );
             }
         }
+        let stack = self.results[i].stack.filter(|_| self.results[i].stack_size > 1);
+        let mut badge_clicked = false;
+        if let Some(stack) = stack {
+            let n = self.results[i].stack_size;
+            let text = painter.layout_no_wrap(n.to_string(), FontId::proportional(12.0), Color32::WHITE);
+            let badge = Rect::from_min_size(
+                rect.right_top() + vec2(-text.size().x - 26.0, 6.0),
+                vec2(text.size().x + 20.0, text.size().y + 6.0),
+            );
+            painter.rect_filled(badge, 9.0, Color32::from_black_alpha(170));
+            // Two offset squares: a stack.
+            for (dx, dy) in [(3.0, -1.0), (0.0, 2.0)] {
+                let sq = Rect::from_center_size(badge.left_center() + vec2(8.0 + dx, dy), Vec2::splat(7.0));
+                painter.rect_stroke(sq, 1.0, Stroke::new(1.2, Color32::WHITE), StrokeKind::Middle);
+            }
+            painter.galley(badge.left_top() + vec2(16.0, 3.0), text, Color32::WHITE);
+            let hover = resp.hover_pos().is_some_and(|p| badge.contains(p));
+            if hover {
+                painter.rect_stroke(badge, 9.0, Stroke::new(1.0, Color32::WHITE), StrokeKind::Inside);
+            }
+            badge_clicked = hover && resp.clicked();
+            if badge_clicked {
+                self.open_stack = Some((stack, n));
+            }
+        }
         if self.selected == Some(i) {
             painter.rect_stroke(rect, 4.0, Stroke::new(3.0, visuals.selection.bg_fill), StrokeKind::Inside);
         } else if resp.hovered() {
             painter.rect_stroke(rect, 4.0, visuals.widgets.hovered.bg_stroke, StrokeKind::Inside);
         }
         let name = Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        resp.on_hover_text_at_pointer(name)
+        let hint = match stack {
+            Some(_) => format!(
+                "{name}\n{} copies, versions or burst frames: click the badge to see them all",
+                self.results[i].stack_size
+            ),
+            None => name,
+        };
+        if badge_clicked {
+            self.search();
+        }
+        resp.on_hover_text_at_pointer(hint)
     }
 
     fn loupe(&mut self, ui: &mut egui::Ui) {
@@ -997,6 +1071,18 @@ impl TintypeApp {
             }
             match view.as_deref() {
                 Some("loupe") => self.view = View::Loupe,
+                Some("stack") => {
+                    let first_stack = self.results.iter().find(|h| h.stack_size > 1).map(|h| (h.stack, h.stack_size));
+                    if let Some((Some(stack), n)) = first_stack {
+                        // Start over once the stack's own results arrive.
+                        self.searched_once = false;
+                        if let Some(s) = &mut self.screenshot {
+                            s.selected = false;
+                            s.plan.view = None;
+                        }
+                        self.open_stack(Some((stack, n)));
+                    }
+                }
                 Some("people" | "person") => {
                     self.tab = Tab::People;
                     self.refresh_people();
