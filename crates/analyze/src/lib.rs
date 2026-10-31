@@ -6,8 +6,14 @@
 //! [`match_probability`] turns that into SigLIP's calibrated probability that
 //! the text describes the image.
 //!
-//! Planned: perceptual hashes (near-duplicates), zero-shot tags from the same
-//! embeddings, an aesthetic score, and optional cloud taggers behind a trait.
+//! Also: the LAION aesthetic score and sharpness ([`quality`]), and a model of
+//! the user's own taste learned from their ratings ([`taste`]).
+
+mod quality;
+mod taste;
+
+pub use quality::{AESTHETIC_VERSION, AestheticScorer, QUALITY_EDGE, SHARPNESS_VERSION, sharpness};
+pub use taste::{MIN_RATINGS, TasteModel, features as taste_features};
 
 use std::path::Path;
 

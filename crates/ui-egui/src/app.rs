@@ -143,6 +143,8 @@ pub struct TintypeApp {
     stats: Option<Stats>,
     /// Library setting, once the engine has said.
     write_sidecars: Option<bool>,
+    /// Aesthetic score setting, and bytes it still needs to download.
+    aesthetic: Option<(bool, u64)>,
     notice: Option<Notice>,
     screenshot: Option<Screenshot>,
 }
@@ -190,6 +192,7 @@ impl TintypeApp {
             scan: None,
             stats: None,
             write_sidecars: None,
+            aesthetic: None,
             notice: None,
             screenshot: screenshot.map(|plan| Screenshot {
                 plan,
@@ -204,7 +207,7 @@ impl TintypeApp {
             app.query = q;
         }
         app.refresh_stats();
-        app.backend.send(Job::Settings, Command::Settings { write_sidecars: None });
+        app.backend.send(Job::Settings, Command::Settings { write_sidecars: None, aesthetic: None });
         app.search();
         // After the first results: pick up sidecars edited by other apps since the last scan.
         app.backend.send(Job::SyncSidecars, Command::SyncSidecars);
@@ -446,8 +449,18 @@ impl TintypeApp {
                     }
                 }
             }
-            (Job::Settings, Ok(Response::Settings { write_sidecars, sidecars })) => {
+            (
+                Job::Settings,
+                Ok(Response::Settings { write_sidecars, aesthetic, aesthetic_download_bytes, sidecars }),
+            ) => {
                 self.write_sidecars = Some(write_sidecars);
+                let turned_on = aesthetic && self.aesthetic.is_some_and(|(was, _)| !was);
+                self.aesthetic = Some((aesthetic, aesthetic_download_bytes));
+                if turned_on {
+                    // Download (if needed) and score right away.
+                    self.refresh_stats();
+                    self.start_analyze();
+                }
                 if let Some(s) = sidecars.filter(|s| s.written + s.failed > 0) {
                     let failed = if s.failed > 0 { format!(", {} failed", thousands(s.failed)) } else { String::new() };
                     self.notify(format!("Wrote {} sidecars{failed}", thousands(s.written)), s.failed > 0);
@@ -566,8 +579,11 @@ impl TintypeApp {
                 ui.add_enabled_ui(!self.settings.smart, |ui| {
                     let label = if self.settings.smart { "Best match" } else { sort_label(self.settings.sort) };
                     egui::ComboBox::from_id_salt("sort").selected_text(label).show_ui(ui, |ui| {
-                        for s in [Sort::Newest, Sort::Oldest, Sort::Relevance] {
-                            ui.selectable_value(&mut self.settings.sort, s, sort_label(s));
+                        for s in [Sort::Newest, Sort::Oldest, Sort::Relevance, Sort::Best] {
+                            let resp = ui.selectable_value(&mut self.settings.sort, s, sort_label(s));
+                            if s == Sort::Best {
+                                resp.on_hover_text(self.best_sort_hint());
+                            }
                         }
                     });
                 })
@@ -649,7 +665,22 @@ impl TintypeApp {
             );
             if resp.changed() {
                 self.write_sidecars = Some(on);
-                self.backend.send(Job::Settings, Command::Settings { write_sidecars: Some(on) });
+                self.backend.send(Job::Settings, Command::Settings { write_sidecars: Some(on), aesthetic: None });
+            }
+            if let Some((mut on, download)) = self.aesthetic {
+                let label = match download {
+                    0 => "Aesthetic score".to_string(),
+                    b => format!("Aesthetic score (downloads {:.1} GB once)", b as f64 / 1e9),
+                };
+                let resp = ui.checkbox(&mut on, label).on_hover_text(
+                    "Scores how good each photo looks with the open LAION aesthetic predictor \
+                     (CLIP ViT-L/14), for the \"Best photos first\" sort and searches like aesthetic:>=6. \
+                     Runs on this computer, about 0.35 s per photo. Once you have rated enough photos, \
+                     Best photos first follows your own taste instead.",
+                );
+                if resp.changed() {
+                    self.backend.send(Job::Settings, Command::Settings { write_sidecars: None, aesthetic: Some(on) });
+                }
             }
         });
     }
@@ -795,6 +826,11 @@ impl TintypeApp {
                     }
                 }
             });
+            if p.rating.is_none()
+                && let Some(s) = p.suggested_rating
+            {
+                ui.weak(format!("Tintype guesses {s:.1} stars, from your ratings."));
+            }
 
             ui.add_space(6.0);
             let m = &p.meta;
@@ -821,6 +857,7 @@ impl TintypeApp {
                 row("Exposure", (!exposure.is_empty()).then(|| exposure.join("   ")));
                 row("Size", m.width.zip(m.height).map(|(w, h)| format!("{w} × {h}")));
                 row("File", Some(format!("{:.1} MB", p.size as f64 / 1_048_576.0)));
+                row("Aesthetic", p.aesthetic.map(|a| format!("{a:.1} of 10")));
             });
             if let Some(g) = m.gps {
                 let url = format!("https://www.openstreetmap.org/?mlat={0}&mlon={1}#map=15/{0}/{1}", g.lat, g.lon);
@@ -1187,6 +1224,7 @@ fn sort_label(s: Sort) -> &'static str {
         Sort::Newest => "Newest first",
         Sort::Oldest => "Oldest first",
         Sort::Relevance => "Best match",
+        Sort::Best => "Best photos first",
     }
 }
 

@@ -43,7 +43,10 @@ impl Catalog {
         let confirmed: HashSet<String> =
             self.confirmed_names(photo_id)?.into_iter().map(|n| n.to_lowercase()).collect();
         let tx = self.conn.transaction()?;
-        tx.execute("UPDATE photos SET rating = ?2 WHERE id = ?1", params![photo_id, sidecar.rating])?;
+        tx.execute(
+            "UPDATE photos SET rating = ?2, rating_source = CASE WHEN ?2 IS NULL THEN NULL ELSE 'sidecar' END WHERE id = ?1",
+            params![photo_id, sidecar.rating],
+        )?;
         tx.execute("DELETE FROM photo_tags WHERE photo_id = ?1", [photo_id])?;
         for tag in sidecar.tags.iter().map(|t| t.trim()).filter(|t| !t.is_empty()) {
             tx.execute("INSERT OR IGNORE INTO photo_tags (photo_id, tag) VALUES (?1, ?2)", params![photo_id, tag])?;

@@ -117,6 +117,10 @@ enum Cmd {
         /// (on by default). Sidecars changed by other apps are always read.
         #[arg(long, value_enum)]
         sidecars: Option<OnOff>,
+        /// Score photos with the LAION aesthetic predictor (downloads 1.2 GB once;
+        /// `analyze` then scores every photo, about 0.35 s each).
+        #[arg(long, value_enum)]
+        aesthetic: Option<OnOff>,
     },
     /// Read JSON commands from stdin, one per line; write one JSON response per line.
     Exec,
@@ -133,6 +137,8 @@ enum SortArg {
     Relevance,
     Newest,
     Oldest,
+    /// Your learned taste once you've rated enough photos, else the aesthetic score.
+    Best,
 }
 
 fn main() -> Result<()> {
@@ -156,6 +162,7 @@ fn main() -> Result<()> {
                 SortArg::Relevance => Sort::Relevance,
                 SortArg::Newest => Sort::Newest,
                 SortArg::Oldest => Sort::Oldest,
+                SortArg::Best => Sort::Best,
             };
             Command::Search { query: query.join(" "), smart, stacks: !unstacked, sort, limit, offset }
         }
@@ -173,7 +180,10 @@ fn main() -> Result<()> {
         Cmd::People => Command::People,
         Cmd::Name { name, faces } => Command::NameFaces { faces, name },
         Cmd::ShowFaces { photo } => Command::PhotoFaces { photo: photo_ref(&photo) },
-        Cmd::Settings { sidecars } => Command::Settings { write_sidecars: sidecars.map(|s| matches!(s, OnOff::On)) },
+        Cmd::Settings { sidecars, aesthetic } => Command::Settings {
+            write_sidecars: sidecars.map(|s| matches!(s, OnOff::On)),
+            aesthetic: aesthetic.map(|s| matches!(s, OnOff::On)),
+        },
     };
 
     let response = engine.execute(cmd, &mut progress)?;
@@ -395,9 +405,14 @@ fn print_response(response: &Response) {
         }
         Response::Changed { photos } => println!("updated {photos} photos"),
         Response::Sidecars(s) => println!("sidecars: {} read, {} written, {} failed", s.imported, s.written, s.failed),
-        Response::Settings { write_sidecars, sidecars } => {
+        Response::Settings { write_sidecars, aesthetic, aesthetic_download_bytes, sidecars } => {
             let state = if *write_sidecars { "on" } else { "off (read only)" };
             println!("sidecars  {state}");
+            let download = match aesthetic_download_bytes {
+                0 => String::new(),
+                b => format!(" ({} MB to download on the next `analyze`)", b / 1_000_000),
+            };
+            println!("aesthetic {}{download}", if *aesthetic { "on" } else { "off" });
             if let Some(s) = sidecars {
                 println!("caught up: {} sidecars written, {} read, {} failed", s.written, s.imported, s.failed);
             }
@@ -411,6 +426,14 @@ fn print_response(response: &Response) {
             }
             if s.unanalyzed > 0 {
                 println!("\n{} photos not yet analyzed for smart search; run `tintype-cli analyze`.", s.unanalyzed);
+            }
+            if s.taste_ratings < s.taste_needed {
+                println!(
+                    "{} of {} ratings made so far; then Tintype learns your taste (sort best).",
+                    s.taste_ratings, s.taste_needed
+                );
+            } else {
+                println!("taste    learned from your {} ratings", s.taste_ratings);
             }
         }
     }
@@ -451,6 +474,8 @@ fn print_photo(p: &PhotoRecord) {
     row("faces", (p.faces > 0).then(|| p.faces.to_string()));
     row("people", (!p.people.is_empty()).then(|| p.people.join(", ")));
     row("stack", p.stack.map(|s| format!("{s}{}", if p.stack_cover { " (shown for the stack)" } else { "" })));
+    row("aesthetic", p.aesthetic.map(|a| format!("{a:.2}")));
+    row("suggested", p.suggested_rating.map(|r| format!("{r:.1} stars, from your ratings")));
     row("hash", p.hash.clone());
     row("error", p.error.clone());
     if !m.fields.is_empty() {

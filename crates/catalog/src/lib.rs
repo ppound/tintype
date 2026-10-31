@@ -12,9 +12,11 @@ use tintype_meta::PhotoMeta;
 
 mod embeddings;
 mod faces;
+mod quality;
 mod sidecars;
 mod stacks;
 pub use faces::{FaceGroup, FaceInfo, FaceRow, NewFace, Person, Suggestion};
+pub use quality::QualityTodo;
 pub use sidecars::SidecarStamp;
 pub use stacks::{StackCandidate, StackPlace};
 
@@ -123,6 +125,16 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE photos ADD COLUMN stack_cover INTEGER NOT NULL DEFAULT 0;
     CREATE INDEX photos_stack ON photos(stack);
 "#,
+    r#"
+    -- Quality: sharpness (to compare frames of one stack) and the LAION aesthetic score.
+    ALTER TABLE photos ADD COLUMN sharpness REAL;
+    ALTER TABLE photos ADD COLUMN sharpness_version INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE photos ADD COLUMN aesthetic REAL;
+    ALTER TABLE photos ADD COLUMN aesthetic_version INTEGER NOT NULL DEFAULT 0;
+    -- Where the rating came from: 'user' (set in Tintype), 'sidecar', or NULL (older catalogs).
+    -- Only the user's own ratings teach Tintype their taste.
+    ALTER TABLE photos ADD COLUMN rating_source TEXT;
+"#,
 ];
 
 /// A photo as produced by a scan, before it has an id.
@@ -168,6 +180,11 @@ pub struct PhotoRecord {
     /// The stack this photo is in, and whether it is the one shown for it.
     pub stack: Option<i64>,
     pub stack_cover: bool,
+    /// The LAION aesthetic score (roughly 1-10), when it has been computed.
+    pub aesthetic: Option<f32>,
+    /// The rating the user's learned taste predicts (filled in by the engine).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggested_rating: Option<f32>,
     pub indexed_at: i64,
 }
 
@@ -237,6 +254,10 @@ impl Catalog {
                                 THEN photos.faces_version ELSE 0 END,
                     analysis_version = CASE WHEN excluded.size = photos.size AND excluded.mtime_ns = photos.mtime_ns
                                 THEN photos.analysis_version ELSE 0 END,
+                    sharpness_version = CASE WHEN excluded.size = photos.size AND excluded.mtime_ns = photos.mtime_ns
+                                THEN photos.sharpness_version ELSE 0 END,
+                    aesthetic_version = CASE WHEN excluded.size = photos.size AND excluded.mtime_ns = photos.mtime_ns
+                                THEN photos.aesthetic_version ELSE 0 END,
                     size = excluded.size, mtime_ns = excluded.mtime_ns,
                     meta = excluded.meta, meta_version = excluded.meta_version,
                     error = excluded.error, indexed_at = excluded.indexed_at
@@ -322,7 +343,9 @@ impl Catalog {
         {
             return Err(Error::BadRating(r));
         }
-        Ok(self.conn.execute("UPDATE photos SET rating = ?2 WHERE id = ?1", params![id, rating])? > 0)
+        let sql = "UPDATE photos SET rating = ?2, rating_source = CASE WHEN ?2 IS NULL THEN NULL ELSE 'user' END
+                   WHERE id = ?1";
+        Ok(self.conn.execute(sql, params![id, rating])? > 0)
     }
 
     /// Adds and removes tags. Tags are trimmed; empty ones are ignored.
@@ -386,7 +409,7 @@ impl Catalog {
 }
 
 const SELECT_PHOTO: &str =
-    "SELECT id, path, size, mtime_ns, hash, meta, error, rating, indexed_at, stack, stack_cover FROM photos";
+    "SELECT id, path, size, mtime_ns, hash, meta, error, rating, indexed_at, stack, stack_cover, aesthetic FROM photos";
 
 /// A row with its metadata JSON not yet parsed (parsing errors aren't rusqlite errors).
 struct RawRecord {
@@ -418,6 +441,8 @@ fn read_row(r: &Row) -> rusqlite::Result<RawRecord> {
             faces: 0,
             stack: r.get(9)?,
             stack_cover: r.get(10)?,
+            aesthetic: r.get(11)?,
+            suggested_rating: None,
             indexed_at: r.get(8)?,
         },
         meta_json: r.get(5)?,

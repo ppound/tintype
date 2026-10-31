@@ -96,6 +96,28 @@ pub const SIGLIP_TOKENIZER: ModelSpec = ModelSpec {
     license: "Apache-2.0",
 };
 
+/// OpenAI CLIP ViT-L/14 image encoder: the input of the LAION aesthetic predictor.
+pub const CLIP_L14_VISION: ModelSpec = ModelSpec {
+    name: "CLIP ViT-L/14 image encoder",
+    file: "clip-vit-large-patch14-vision.onnx",
+    url: "https://huggingface.co/Xenova/clip-vit-large-patch14/resolve/main/onnx/vision_model.onnx",
+    sha256: "ff49f8aa57c7abfd26e382eb083e4dbf988505223a9bd3767dbfd4e729206709",
+    bytes: 1_216_438_437,
+    license: "MIT",
+};
+
+/// LAION improved aesthetic predictor (sac+logos+ava1, linear MSE): a 5-layer
+/// head on CLIP ViT-L/14 embeddings. A PyTorch zip; its weights are read as
+/// raw float32 blocks, never unpickled.
+pub const LAION_AESTHETIC_HEAD: ModelSpec = ModelSpec {
+    name: "LAION aesthetic predictor",
+    file: "laion-aesthetic-sac-logos-ava1-l14-linearMSE.pth",
+    url: "https://huggingface.co/camenduru/improved-aesthetic-predictor/resolve/main/sac%2Blogos%2Bava1-l14-linearMSE.pth",
+    sha256: "21dd590f3ccdc646f0d53120778b296013b096a035a2718c9cb0d511bff0f1e0",
+    bytes: 3_714_759,
+    license: "Apache-2.0",
+};
+
 /// Where downloaded models live.
 #[derive(Debug, Clone)]
 pub struct ModelStore {

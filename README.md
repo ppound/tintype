@@ -4,7 +4,7 @@ Index, search and tag your photo library. One binary, no Java, Docker, WSL2 or
 Python. A Rust rewrite of [PhotoStat](https://github.com/ppound/photostat).
 
 Status: indexing, search, the desktop app, face recognition, smart (semantic)
-search and duplicate stacking work. Packaging is next (see [Roadmap](#roadmap)).
+search, duplicate stacking and quality scores work. Packaging is next (see [Roadmap](#roadmap)).
 
 ## Desktop app
 
@@ -34,7 +34,13 @@ never changes, moves or deletes a photo. You get:
   first. Field terms like `year:2024` or `rating:>=4` still filter. Tintype
   looks at each photo once first (**Analyze photos**, about 0.15 s per photo).
 
-Face recognition and smart search run entirely on your computer; nothing is uploaded.
+- **Best photos first** (sort menu): once you have rated about 30 photos in Tintype, it
+  learns your taste from them and orders by it, and the details panel shows its guess
+  for unrated photos. Before that, it uses the **aesthetic score** (Settings ›
+  Aesthetic score: the open LAION predictor, a one-time 1.2 GB download, about 0.35 s
+  per photo). Ratings read from sidecars don't count: they may be another program's.
+
+Face recognition, smart search and quality scores run entirely on your computer; nothing is uploaded.
 
 ### Sidecars: your metadata travels with your photos
 
@@ -71,7 +77,22 @@ Photos are stacked when they are one shot in several files, tuned on a real
 
 Looks alone never stack photos taken at different times: the same view at sunrise
 and sunset scores as alike as an edit. A stack of bursts spans at most a minute.
-Bursts and repeats need **Analyze photos** (smart search) to have run. The first
+Bursts and repeats need **Analyze photos** (smart search) to have run.
+
+### Quality
+
+Measured on the same library before choosing:
+
+- **Aesthetic score**: the LAION improved aesthetic predictor (CLIP ViT-L/14 and a small
+  head trained on human ratings, Apache-2.0) put well-composed scenes on top and weak
+  snapshots at the bottom. Asking SigLIP "a beautiful photo" vs "a bad photo" instead
+  ranked subjects (ornate interiors, peacocks), not photography. The head's PyTorch file
+  is read as raw float32 blocks; nothing in it is ever executed.
+- **Sharpness** (Laplacian variance of the sharpest tiles) is no use on its own for
+  finding rejects: a plane in an empty sky and portraits with blurred backgrounds scored
+  lowest. It only decides between frames of one stack, so a burst shows its sharpest frame.
+- **Your taste** is ridge regression from a photo's SigLIP embedding (plus its aesthetic
+  score) to the ratings you gave in Tintype, refitted when your ratings change. The first
 run downloads two small open models (YuNet, MIT; SFace, Apache-2.0; 39 MB in
 total), verified by SHA-256. Smart search downloads Google's SigLIP B/16
 (Apache-2.0, 815 MB) the first time.
@@ -93,6 +114,8 @@ tintype-cli people                          # named people and unnamed groups
 tintype-cli name "Ada" 113 681 871          # name faces (ids from `people`)
 tintype-cli analyze                         # embed photos for smart search
 tintype-cli settings --sidecars off         # stop writing .xmp sidecars
+tintype-cli settings --aesthetic on         # score photos (LAION, 1.2 GB); then `analyze`
+tintype-cli search --sort best              # your taste once you've rated ~30 photos
 tintype-cli search --smart dog on a beach year:2024
 ```
 
@@ -116,6 +139,7 @@ All terms must match.
 | `person:ada` `faces:>=3`       | people (named faces) and number of faces    |
 | `gps:true`                     | photos with a location                      |
 | `stack:12`                     | every photo of one stack                    |
+| `aesthetic:>=6`                | aesthetic score (when turned on; most photos score 4-7) |
 | `camera:"/FUJIFILM/X-T5"` `ext:/raf` `folder:"/C:/Users/me/Pictures/2024"` | facets |
 
 With `--smart` (the app's **Smart** toggle), terms with a `field:` still filter as
@@ -149,7 +173,7 @@ layer 7  apps/tintype (desktop)  apps/tintype-cli
 | `engine`   | Command registry. CLI, GUI and automation all run the same serde `Command`s |
 | `codecs`   | Thumbnails and previews: DCT-scaled JPEG decoding, RAF embedded JPEGs, a disk thumbnail cache. HEIC and other RAW formats are *planned* |
 | `infer`    | Model registry, verified downloads, and ONNX inference on `tract` (pure Rust, no native libraries). An ONNX Runtime backend for large models and GPUs is *planned* |
-| `analyze`  | SigLIP image and text embeddings for smart search. Near-duplicates, auto-tags and an aesthetic score are *planned* |
+| `analyze`  | SigLIP image and text embeddings for smart search; LAION aesthetic score, sharpness, learned taste. Auto-tags are *planned* |
 | `faces`    | YuNet detection, landmark alignment, SFace embeddings, Chinese Whispers grouping, k-nearest matching |
 | `ui-egui`  | The desktop UI. The engine runs on its own thread and thumbnails decode on a worker pool, newest request first |
 
@@ -194,8 +218,9 @@ a screenshot and exits. `TINTYPE_SCREENSHOT_SELECT=<n>` selects a result first,
    Next: RAF sensor dimensions, HEIC and other RAW previews, app icon, paging for very large result sets
 3. ~~Faces: detect, group, name, suggest, merge~~
    Next: faster face passes, HEIC/DNG previews for detection, scaling grouping past ~20k faces
-4. ~~Smart search (SigLIP embeddings)~~, ~~stacks of duplicates, versions and bursts~~
-   Next: zero-shot auto-tags, aesthetic score
+4. ~~Smart search (SigLIP embeddings)~~, ~~stacks of duplicates, versions and bursts~~,
+   ~~aesthetic score, learned taste~~
+   Next: zero-shot auto-tags, a review list for culling
 5. Packaging: MSI, DMG, AppImage from CI
 6. ~~Read and write PhotoStat XMP sidecars~~
    Next: import PhotoStat's JSON data, if any; use `photostat:place`

@@ -9,11 +9,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
-use tintype_analyze::{ANALYSIS_VERSION, ImageEncoder, TextEncoder};
+use tintype_analyze::{
+    AESTHETIC_VERSION, ANALYSIS_VERSION, AestheticScorer, ImageEncoder, MIN_RATINGS, SHARPNESS_VERSION, TasteModel,
+    TextEncoder, taste_features,
+};
 use tintype_catalog::{Catalog, StackPlace};
 use tintype_faces::{FACES_VERSION, FaceAnalyzer};
 use tintype_index::PhotoIndex;
-use tintype_infer::{ModelSpec, ModelStore, SFACE, SIGLIP_TEXT, SIGLIP_TOKENIZER, SIGLIP_VISION, YUNET};
+use tintype_infer::{
+    CLIP_L14_VISION, LAION_AESTHETIC_HEAD, ModelSpec, ModelStore, SFACE, SIGLIP_TEXT, SIGLIP_TOKENIZER, SIGLIP_VISION,
+    YUNET,
+};
 use tintype_jobs::{ScanOptions, SyncMode};
 
 pub use tintype_catalog::{FaceGroup, FaceInfo, Person, PhotoRecord};
@@ -167,6 +173,10 @@ pub enum Command {
         /// Keep ratings, tags and people in `photo.jpg.xmp` sidecars next to the photos.
         #[serde(default)]
         write_sidecars: Option<bool>,
+        /// Score photos with the LAION aesthetic predictor (a one-time 1.2 GB
+        /// download; `Analyze` then scores every photo).
+        #[serde(default)]
+        aesthetic: Option<bool>,
     },
 }
 
@@ -219,6 +229,9 @@ pub enum Response {
     Sidecars(SidecarReport),
     Settings {
         write_sidecars: bool,
+        aesthetic: bool,
+        /// Bytes still to download for the aesthetic score (0 when ready).
+        aesthetic_download_bytes: u64,
         /// What turning sidecar writing on just did, if it was turned on.
         #[serde(skip_serializing_if = "Option::is_none")]
         sidecars: Option<SidecarReport>,
@@ -231,11 +244,17 @@ pub struct Stats {
     pub photos: u64,
     pub indexed: u64,
     pub folders: Vec<String>,
-    /// Photos not yet analyzed for smart search.
+    /// Photos not yet fully analyzed (smart search, sharpness, aesthetic score)...
     pub unanalyzed: u64,
+    /// ...and the passes over photos that this takes (a photo may need two):
+    /// `Analyze` counts its `remaining` in these.
+    pub analysis_steps: u64,
     /// Smart search models are downloaded; if not, `smart_download_bytes` will be.
     pub smart_ready: bool,
     pub smart_download_bytes: u64,
+    /// Ratings the user gave in Tintype, and how many the taste model needs.
+    pub taste_ratings: u64,
+    pub taste_needed: u64,
 }
 
 /// Progress from long-running commands.
@@ -277,6 +296,12 @@ const STACKS_SETTING: &str = "stacks.version";
 /// Library setting: write XMP sidecars ("1", the default) or only read them ("0").
 const WRITE_SIDECARS: &str = "sidecars.write";
 
+/// Library setting: compute the LAION aesthetic score ("1") or not (the default).
+const AESTHETIC_SETTING: &str = "aesthetic.enabled";
+
+/// Models the aesthetic score needs, downloaded when it is turned on and analysis runs.
+const AESTHETIC_MODELS: [ModelSpec; 2] = [CLIP_L14_VISION, LAION_AESTHETIC_HEAD];
+
 /// Models smart search needs, downloaded together.
 const SMART_MODELS: [ModelSpec; 3] = [SIGLIP_VISION, SIGLIP_TEXT, SIGLIP_TOKENIZER];
 
@@ -298,6 +323,10 @@ pub struct Engine {
     embeddings: Option<Vec<(i64, Vec<f32>)>>,
     /// Every stacked photo's place, loaded on the first stacked search after a change.
     stack_places: Option<HashMap<i64, StackPlace>>,
+    aesthetic_scorer: Option<Arc<AestheticScorer>>,
+    /// The user's learned taste: `None` until (re)fitted, `Some(None)` when
+    /// there aren't enough ratings yet.
+    taste: Option<Option<TasteModel>>,
 }
 
 impl Engine {
@@ -322,6 +351,8 @@ impl Engine {
             text_encoder: None,
             embeddings: None,
             stack_places: None,
+            aesthetic_scorer: None,
+            taste: None,
         };
         if fresh || engine.index.doc_count() != engine.catalog.count()? {
             tracing::info!(fresh, "rebuilding search index");
@@ -377,11 +408,17 @@ impl Engine {
             }
             Command::Search { query, smart, sort, limit, offset, stacks } => {
                 let smart = smart && !tintype_index::split_smart(&query).1.is_empty();
-                if !smart && !stacks {
+                let by_taste = !smart && sort == Sort::Best && self.taste_model()?.is_some();
+                if !smart && !stacks && !by_taste {
                     return Ok(Response::Search(self.index.search(&query, sort, limit, offset)?));
                 }
-                let ordered =
-                    if smart { self.smart_ranked(&query, events)? } else { self.index.ordered_ids(&query, sort)? };
+                let ordered = if smart {
+                    self.smart_ranked(&query, events)?
+                } else if by_taste {
+                    self.taste_ranked(&query)?
+                } else {
+                    self.index.ordered_ids(&query, sort)?
+                };
                 self.page(ordered, stacks, limit, offset).map(Response::Search)
             }
             Command::Facets { field, query, parent } => {
@@ -389,7 +426,10 @@ impl Engine {
             }
             // No sidecar check here: on a busy network share it would hold up
             // the details panel. Startup and scans pick up outside edits.
-            Command::Show { photo } => Ok(Response::Photo(Box::new(self.resolve(&photo)?))),
+            Command::Show { photo } => {
+                let rec = self.resolve(&photo)?;
+                Ok(Response::Photo(Box::new(self.with_suggestion(rec)?)))
+            }
             Command::SyncSidecars => {
                 let roots: Vec<PathBuf> =
                     self.catalog.roots()?.into_iter().map(PathBuf::from).filter(|r| r.is_dir()).collect();
@@ -402,6 +442,7 @@ impl Engine {
                 let id = self.resolve(&photo)?.id;
                 self.before_edit(&[id])?;
                 self.catalog.set_rating(id, rating)?;
+                self.taste = None;
                 self.after_edit(&[id])?;
                 let moved = tintype_jobs::refresh_cover(&mut self.catalog, id)?;
                 if !moved.is_empty() {
@@ -424,13 +465,21 @@ impl Engine {
                 photos: self.catalog.count()?,
                 indexed: self.index.doc_count(),
                 folders: self.catalog.roots()?,
-                unanalyzed: self.catalog.count_needing_analysis(ANALYSIS_VERSION)?,
+                unanalyzed: self.catalog.count_needing_any_analysis(
+                    ANALYSIS_VERSION,
+                    SHARPNESS_VERSION,
+                    self.aesthetic_version()?,
+                )?,
+                analysis_steps: self.catalog.count_needing_analysis(ANALYSIS_VERSION)?
+                    + self.catalog.count_needing_quality(SHARPNESS_VERSION, self.aesthetic_version()?)?,
                 smart_ready: SMART_MODELS.iter().all(|m| self.models.is_installed(m)),
                 smart_download_bytes: SMART_MODELS
                     .iter()
                     .filter(|m| !self.models.is_installed(m))
                     .map(|m| m.bytes)
                     .sum(),
+                taste_ratings: self.catalog.user_ratings()?.len() as u64,
+                taste_needed: MIN_RATINGS as u64,
             })),
 
             Command::FindFaces { batch } => self.find_faces(batch, events).map(Response::Faces),
@@ -477,7 +526,13 @@ impl Engine {
                 self.after_edit(&photos)?;
                 self.after_people_edit(photos)
             }
-            Command::Settings { write_sidecars } => {
+            Command::Settings { write_sidecars, aesthetic } => {
+                if let Some(on) = aesthetic {
+                    self.catalog.set_setting(AESTHETIC_SETTING, if on { "1" } else { "0" })?;
+                    if !on {
+                        self.aesthetic_scorer = None;
+                    }
+                }
                 let mut sidecars = None;
                 if let Some(on) = write_sidecars {
                     let was_on = self.write_sidecars_on()?;
@@ -491,7 +546,16 @@ impl Engine {
                         sidecars = Some(report);
                     }
                 }
-                Ok(Response::Settings { write_sidecars: self.write_sidecars_on()?, sidecars })
+                Ok(Response::Settings {
+                    write_sidecars: self.write_sidecars_on()?,
+                    aesthetic: self.aesthetic_version()?.is_some(),
+                    aesthetic_download_bytes: AESTHETIC_MODELS
+                        .iter()
+                        .filter(|m| !self.models.is_installed(m))
+                        .map(|m| m.bytes)
+                        .sum(),
+                    sidecars,
+                })
             }
         }
     }
@@ -558,18 +622,134 @@ impl Engine {
         Ok(self.text_encoder.as_ref().expect("loaded above"))
     }
 
+    /// The aesthetic score's version when it is turned on.
+    fn aesthetic_version(&self) -> Result<Option<u32>> {
+        Ok((self.catalog.setting(AESTHETIC_SETTING)?.as_deref() == Some("1")).then_some(AESTHETIC_VERSION))
+    }
+
+    fn aesthetic_scorer(&mut self, events: &mut dyn FnMut(Event)) -> Result<Arc<AestheticScorer>> {
+        if let Some(s) = &self.aesthetic_scorer {
+            return Ok(s.clone());
+        }
+        for spec in AESTHETIC_MODELS {
+            let mut progress = |done, total| events(Event::Download { model: spec.name, done, total });
+            self.models.ensure(&spec, &mut progress)?;
+        }
+        let scorer = Arc::new(AestheticScorer::load(
+            &self.models.path(&CLIP_L14_VISION),
+            &self.models.path(&LAION_AESTHETIC_HEAD),
+        )?);
+        self.aesthetic_scorer = Some(scorer.clone());
+        Ok(scorer)
+    }
+
+    /// One batch of analysis: smart search embeddings first, then quality
+    /// (sharpness, and the aesthetic score when it is on). `remaining`
+    /// counts the work left in both passes.
     fn analyze(&mut self, batch: usize, events: &mut dyn FnMut(Event)) -> Result<AnalyzeReport> {
-        let encoder = self.image_encoder(events)?;
-        let mut progress = |done, total| events(Event::Analyze { done, total });
-        let report = tintype_jobs::analyze(&mut self.catalog, &encoder, batch.max(1), &self.cancel, &mut progress)?;
-        if report.processed > 0 {
-            self.embeddings = None;
-            // Bursts are found by looks: stack again once a pass ends.
-            if report.remaining == 0 || report.cancelled {
-                self.restack()?;
+        let aesthetic = self.aesthetic_version()?;
+        let mut report = if self.catalog.count_needing_analysis(ANALYSIS_VERSION)? > 0 {
+            let encoder = self.image_encoder(events)?;
+            let mut progress = |done, total| events(Event::Analyze { done, total });
+            let r = tintype_jobs::analyze(&mut self.catalog, &encoder, batch.max(1), &self.cancel, &mut progress)?;
+            if r.processed > 0 {
+                self.embeddings = None;
+                self.taste = None;
             }
+            r
+        } else {
+            let scorer = match aesthetic {
+                Some(_) => Some(self.aesthetic_scorer(events)?),
+                None => None,
+            };
+            let mut progress = |done, total| events(Event::Analyze { done, total });
+            let q = tintype_jobs::measure_quality(
+                &mut self.catalog,
+                scorer.as_deref(),
+                batch.max(1),
+                &self.cancel,
+                &mut progress,
+            )?;
+            if q.processed > 0 && scorer.is_some() {
+                self.taste = None;
+            }
+            let pending = self.catalog.index_pending()?;
+            self.reindex_photos(pending)?;
+            AnalyzeReport {
+                processed: q.processed,
+                failed: q.failed,
+                remaining: q.remaining,
+                cancelled: q.cancelled,
+                elapsed_ms: q.elapsed_ms,
+            }
+        };
+        report.remaining = self.catalog.count_needing_analysis(ANALYSIS_VERSION)?
+            + self.catalog.count_needing_quality(SHARPNESS_VERSION, aesthetic)?;
+        // Bursts are found by looks, and covers prefer the sharpest frame: stack again once the work is done.
+        if report.processed > 0 && (report.remaining == 0 || report.cancelled) {
+            self.restack()?;
         }
         Ok(report)
+    }
+
+    /// The user's learned taste, fitted on their ratings the first time it is needed after a change.
+    fn taste_model(&mut self) -> Result<Option<&TasteModel>> {
+        if self.taste.is_none() {
+            if self.embeddings.is_none() {
+                self.embeddings = Some(self.catalog.embeddings()?);
+            }
+            let embeddings: HashMap<i64, &Vec<f32>> =
+                self.embeddings.iter().flatten().map(|(id, v)| (*id, v)).collect();
+            let aesthetic = self.catalog.aesthetic_scores()?;
+            let samples: Vec<(Vec<f32>, f32)> = self
+                .catalog
+                .user_ratings()?
+                .into_iter()
+                .filter_map(|(id, r)| {
+                    embeddings.get(&id).map(|e| (taste_features(e, aesthetic.get(&id).copied()), f32::from(r)))
+                })
+                .collect();
+            self.taste = Some(TasteModel::fit(&samples));
+        }
+        Ok(self.taste.as_ref().and_then(Option::as_ref))
+    }
+
+    /// What the learned taste predicts for each photo with an embedding.
+    fn taste_predictions(&mut self) -> Result<HashMap<i64, f32>> {
+        let aesthetic = self.catalog.aesthetic_scores()?;
+        let Some(model) = self.taste_model()?.cloned() else { return Ok(HashMap::new()) };
+        Ok(self
+            .embeddings
+            .iter()
+            .flatten()
+            .map(|(id, e)| (*id, model.predict(&taste_features(e, aesthetic.get(id).copied()))))
+            .collect())
+    }
+
+    /// Photos matching `query`, the ones the user would like most first;
+    /// photos the model can't judge (not analyzed) come last, newest first.
+    fn taste_ranked(&mut self, query: &str) -> Result<Vec<i64>> {
+        let predicted = self.taste_predictions()?;
+        let mut ids = self.index.ordered_ids(query, Sort::Newest)?;
+        // Stable: unjudged photos keep their newest-first order at the end.
+        ids.sort_by(|a, b| {
+            let (pa, pb) = (predicted.get(a), predicted.get(b));
+            pb.unwrap_or(&f32::MIN).total_cmp(pa.unwrap_or(&f32::MIN))
+        });
+        Ok(ids)
+    }
+
+    /// Adds the learned taste's suggestion to a record shown to the user.
+    fn with_suggestion(&mut self, mut rec: PhotoRecord) -> Result<PhotoRecord> {
+        if self.taste_model()?.is_some() {
+            if self.embeddings.is_none() {
+                self.embeddings = Some(self.catalog.embeddings()?);
+            }
+            let model = self.taste_model()?.cloned().expect("checked above");
+            let emb = self.embeddings.iter().flatten().find(|(id, _)| *id == rec.id).map(|(_, e)| e);
+            rec.suggested_rating = emb.map(|e| model.predict(&taste_features(e, rec.aesthetic)));
+        }
+        Ok(rec)
     }
 
     /// Ranks photos that pass the query's field terms by how well they match its words.
@@ -682,6 +862,7 @@ impl Engine {
         self.index.commit()?;
         self.catalog.clear_index_pending(Some(&report.changed_ids))?;
         if report.added + report.updated + report.removed + report.moved > 0 {
+            self.taste = None;
             self.restack()?;
         }
         Ok(report)
@@ -724,7 +905,7 @@ impl Engine {
         let rec = self.catalog.get(id)?.ok_or_else(|| Error::PhotoNotFound(id.to_string()))?;
         self.index.upsert([&rec])?;
         self.index.commit()?;
-        Ok(Response::Photo(Box::new(rec)))
+        Ok(Response::Photo(Box::new(self.with_suggestion(rec)?)))
     }
 
     fn resolve(&self, photo: &PhotoRef) -> Result<PhotoRecord> {
@@ -911,14 +1092,14 @@ mod tests {
         assert_eq!(tintype_meta::xmp::read_sidecar(&b).unwrap().unwrap().rating, Some(5));
 
         // With writing off, edits stay in the catalog.
-        let off = Command::Settings { write_sidecars: Some(false) };
+        let off = Command::Settings { write_sidecars: Some(false), aesthetic: None };
         let Response::Settings { write_sidecars, .. } = engine.execute(off, &mut |_| {}).unwrap() else { panic!() };
         assert!(!write_sidecars);
         engine.execute(Command::Rate { photo: PhotoRef::Path(b.clone()), rating: Some(1) }, &mut |_| {}).unwrap();
         assert_eq!(tintype_meta::xmp::read_sidecar(&b).unwrap().unwrap().rating, Some(5));
 
         // Turning it back on catches up.
-        let on = Command::Settings { write_sidecars: Some(true) };
+        let on = Command::Settings { write_sidecars: Some(true), aesthetic: None };
         engine.execute(on, &mut |_| {}).unwrap();
         assert_eq!(tintype_meta::xmp::read_sidecar(&b).unwrap().unwrap().rating, Some(1));
     }
@@ -984,6 +1165,65 @@ mod tests {
         let stack = r.hits.iter().find(|h| h.stack_size == 2).expect("a stack of two").stack.unwrap();
         assert_eq!(hits(&mut engine, &format!("stack:{stack}")).len(), 2, "the stack opens with stack:<id>");
         assert_eq!(hits(&mut engine, "").len(), 3, "unstacked shows all");
+    }
+
+    #[test]
+    fn learned_taste_ranks_best_first_and_suggests_ratings() {
+        // 36 rated photos whose "look" (a synthetic embedding at angle a) predicts
+        // the rating, plus two unrated ones the user should love and dislike.
+        let photos = tempfile::tempdir().unwrap();
+        let names: Vec<String> = (0..38).map(|i| format!("p{i:02}.jpg")).collect();
+        for n in &names {
+            JpegSpec { taken: None, ..JpegSpec::canon() }.write(&photos.path().join(n));
+        }
+        let lib = tempfile::tempdir().unwrap();
+        let mut engine = Engine::open(lib.path()).unwrap();
+        engine.execute(Command::Scan { roots: vec![photos.path().into()], hash: false }, &mut |_| {}).unwrap();
+        let id = |engine: &Engine, n: &str| {
+            let p = tintype_jobs::normalize_path(&photos.path().join(n)).unwrap();
+            engine.catalog.get_by_path(&p.display().to_string()).unwrap().unwrap().id
+        };
+        let quarter = std::f32::consts::FRAC_PI_2;
+        let angle = |i: usize| match i {
+            36 => 0.03,
+            37 => 1.5,
+            _ => i as f32 / 36.0 * quarter,
+        };
+        let ids: Vec<i64> = names.iter().map(|n| id(&engine, n)).collect();
+        for (i, &pid) in ids.iter().enumerate() {
+            let a = angle(i);
+            engine.catalog.set_embedding(pid, Some(&[a.cos(), a.sin(), 0.0]), ANALYSIS_VERSION).unwrap();
+        }
+        // As an analysis pass would.
+        (engine.embeddings, engine.taste) = (None, None);
+        for (i, &pid) in ids.iter().enumerate().take(36) {
+            let rating = (5.0 - 4.0 * angle(i) / quarter).round() as u8;
+            engine.execute(Command::Rate { photo: PhotoRef::Id(pid), rating: Some(rating) }, &mut |_| {}).unwrap();
+        }
+
+        let Response::Stats(stats) = engine.execute(Command::Stats, &mut |_| {}).unwrap() else { panic!() };
+        assert_eq!((stats.taste_ratings, stats.taste_needed), (36, MIN_RATINGS as u64));
+        let (loved, disliked) = (id(&engine, "p36.jpg"), id(&engine, "p37.jpg"));
+        let show = |engine: &mut Engine, pid| {
+            let Response::Photo(p) = engine.execute(Command::Show { photo: PhotoRef::Id(pid) }, &mut |_| {}).unwrap()
+            else {
+                panic!()
+            };
+            p.suggested_rating.unwrap()
+        };
+        assert!(show(&mut engine, loved) > 4.0 && show(&mut engine, disliked) < 2.5);
+
+        let best = Command::Search {
+            query: String::new(),
+            smart: false,
+            stacks: false,
+            sort: Sort::Best,
+            limit: 50,
+            offset: 0,
+        };
+        let Response::Search(r) = engine.execute(best, &mut |_| {}).unwrap() else { panic!() };
+        let pos = |pid| r.hits.iter().position(|h| h.id == pid).unwrap();
+        assert!(pos(loved) < 5 && pos(disliked) > 30, "{} {}", pos(loved), pos(disliked));
     }
 
     #[test]

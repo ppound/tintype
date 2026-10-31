@@ -25,6 +25,8 @@ pub struct StackCandidate {
     pub rating: Option<u8>,
     /// Width x height, 0 if unknown.
     pub pixels: u64,
+    /// Measured sharpness, to prefer the sharpest frame of a burst.
+    pub sharpness: Option<f32>,
     pub raw: bool,
     pub mtime_ns: i64,
 }
@@ -58,6 +60,7 @@ fn candidate(
         rating,
         pixels: u64::from(meta.width.unwrap_or(0)) * u64::from(meta.height.unwrap_or(0)),
         raw: RAW_EXTENSIONS.contains(&ext.as_str()),
+        sharpness: None,
         mtime_ns,
     }
 }
@@ -77,8 +80,8 @@ fn model_key(make: Option<&str>, model: &str) -> Option<String> {
 impl Catalog {
     /// Grouping inputs for every photo, or only the members of `stack`.
     pub fn stack_candidates(&self, stack: Option<i64>) -> Result<Vec<StackCandidate>> {
-        let sql =
-            "SELECT id, path, hash, meta, rating, mtime_ns FROM photos WHERE ?1 IS NULL OR stack = ?1 ORDER BY id";
+        let sql = "SELECT id, path, hash, meta, rating, mtime_ns, sharpness FROM photos
+                   WHERE ?1 IS NULL OR stack = ?1 ORDER BY id";
         let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt.query_map([stack], |r| {
             Ok((
@@ -88,13 +91,14 @@ impl Catalog {
                 r.get::<_, String>(3)?,
                 r.get::<_, Option<u8>>(4)?,
                 r.get::<_, i64>(5)?,
+                r.get::<_, Option<f32>>(6)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (id, path, hash, meta, rating, mtime_ns) = row?;
+            let (id, path, hash, meta, rating, mtime_ns, sharpness) = row?;
             let meta: PhotoMeta = serde_json::from_str(&meta).map_err(|source| crate::Error::Json { id, source })?;
-            out.push(candidate(id, &path, hash, &meta, rating, mtime_ns));
+            out.push(StackCandidate { sharpness, ..candidate(id, &path, hash, &meta, rating, mtime_ns) });
         }
         Ok(out)
     }

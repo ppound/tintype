@@ -16,7 +16,8 @@
 //!   (stripped exports) are matched by looks alone, and strictly.
 //!
 //! The cover (the photo shown for the stack) is the highest rated, then the
-//! largest, then a non-raw file, then the most recently changed.
+//! largest, then a non-raw file, then the sharpest (the best frame of a
+//! burst), then the most recently changed.
 
 use std::collections::HashMap;
 
@@ -186,7 +187,14 @@ pub fn group(photos: &[StackCandidate], embeddings: &HashMap<i64, Vec<f32>>) -> 
 /// The photo to show for a stack.
 pub fn cover<'a>(members: impl Iterator<Item = &'a StackCandidate>) -> i64 {
     members
-        .max_by_key(|p| (p.rating.unwrap_or(0), p.pixels, !p.raw, p.mtime_ns, std::cmp::Reverse(p.id)))
+        .max_by(|a, b| {
+            let key = |p: &StackCandidate| (p.rating.unwrap_or(0), p.pixels, !p.raw);
+            key(a)
+                .cmp(&key(b))
+                .then(a.sharpness.unwrap_or(0.0).total_cmp(&b.sharpness.unwrap_or(0.0)))
+                .then(a.mtime_ns.cmp(&b.mtime_ns))
+                .then(b.id.cmp(&a.id))
+        })
         .map(|p| p.id)
         .expect("a stack has members")
 }
@@ -224,6 +232,7 @@ mod tests {
             rating: None,
             pixels: 0,
             raw: false,
+            sharpness: None,
             mtime_ns: 0,
         }
     }
@@ -319,5 +328,10 @@ mod tests {
         assert_eq!(cover([&a, &b].into_iter()), 2);
         a.rating = Some(3);
         assert_eq!(cover([&a, &b].into_iter()), 1);
+        // Two frames of a burst: the sharper one.
+        let (mut c, mut d) = (photo(3, "A", None), photo(4, "A", None));
+        c.sharpness = Some(900.0);
+        d.sharpness = Some(1500.0);
+        assert_eq!(cover([&c, &d].into_iter()), 4);
     }
 }

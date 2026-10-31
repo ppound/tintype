@@ -12,6 +12,8 @@ const ANALYZE_BATCH: usize = 200;
 /// Measured on a 14-core laptop: 4,253 photos (JPG and RAF) took 12.7 minutes,
 /// ~0.18 s each, with a compile competing for the cores.
 const SECONDS_PER_PHOTO: f64 = 0.15;
+/// ViT-L/14 on tract: 2.0 s per photo per core, ~6x across cores.
+const AESTHETIC_SECONDS_PER_PHOTO: f64 = 0.35;
 
 #[derive(Default)]
 pub(super) struct SmartState {
@@ -33,11 +35,11 @@ impl SmartState {
 }
 
 impl TintypeApp {
-    fn start_analyze(&mut self) {
+    pub(super) fn start_analyze(&mut self) {
         if self.smart.analyzing.is_some() || self.scan.is_some() {
             return;
         }
-        let total = self.stats.as_ref().map_or(1, |s| s.unanalyzed.max(1));
+        let total = self.stats.as_ref().map_or(1, |s| s.analysis_steps.max(1));
         self.smart.analyzing = Some(AnalyzeProgress { total, done: 0, stop: false });
         self.scan = Some(ScanState { label: "Preparing smart search…".into(), fraction: None });
         self.backend.send(Job::Analyze, Command::Analyze { batch: ANALYZE_BATCH });
@@ -86,6 +88,29 @@ impl TintypeApp {
         true
     }
 
+    /// Measured: smart search ~0.15 s per photo; the aesthetic score adds ~0.35 s.
+    fn seconds_per_photo(&self) -> f64 {
+        SECONDS_PER_PHOTO + if self.aesthetic.is_some_and(|(on, _)| on) { AESTHETIC_SECONDS_PER_PHOTO } else { 0.0 }
+    }
+
+    /// What "Best photos first" will use, for its tooltip.
+    pub(super) fn best_sort_hint(&self) -> String {
+        let Some(s) = &self.stats else { return String::new() };
+        if s.taste_ratings >= s.taste_needed {
+            format!("Ordered by your taste, learned from the {} photos you rated.", s.taste_ratings)
+        } else if self.aesthetic.is_some_and(|(on, _)| on) {
+            format!(
+                "Ordered by the aesthetic score. After you rate {} more photos, by your own taste.",
+                s.taste_needed - s.taste_ratings
+            )
+        } else {
+            format!(
+                "Turn on Settings > Aesthetic score, or rate {} more photos, so Tintype can order by quality.",
+                s.taste_needed - s.taste_ratings
+            )
+        }
+    }
+
     /// Under the search bar while smart search is on and photos still need analysis.
     pub(super) fn smart_banner(&mut self, ui: &mut egui::Ui) {
         let Some(stats) = &self.stats else { return };
@@ -103,7 +128,7 @@ impl TintypeApp {
                     "Tintype looks at each photo once first: {} photos, {} on this computer. \
                      Nothing is uploaded.",
                     thousands(unanalyzed),
-                    duration(unanalyzed as f64 * SECONDS_PER_PHOTO)
+                    duration(unanalyzed as f64 * self.seconds_per_photo())
                 ));
             } else {
                 ui.label(format!(

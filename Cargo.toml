@@ -52,6 +52,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ureq = "3"
 walkdir = "2.5"
+zip = { version = "9.2", default-features = false }
 
 [profile.dev.package."*"]
 # Dependencies (sqlite, tantivy, exif parsing) are slow unoptimized; our own code stays debuggable.

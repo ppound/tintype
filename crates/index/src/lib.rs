@@ -15,6 +15,7 @@
 //! | `rating:>=4 tag:family`     | the user's own metadata                    |
 //! | `person:alice` `faces:>=3`  | people (named faces) and face count         |
 //! | `stack:12`                  | the photos of one stack                    |
+//! | `aesthetic:>=6`             | LAION aesthetic score (when computed)      |
 //! | `gps:true`                  | has location                               |
 //!
 //! Smart (semantic) search is done by the engine: [`split_smart`] separates
@@ -32,7 +33,7 @@ use tantivy::{DateTime, DocAddress, Index, IndexReader, IndexWriter, Order, Relo
 use tintype_catalog::PhotoRecord;
 
 /// Bump whenever the schema or the way documents are built changes.
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 const VERSION_FILE: &str = "tintype-schema-version";
 const WRITER_HEAP_BYTES: usize = 128 * 1024 * 1024;
 
@@ -64,6 +65,8 @@ pub enum Sort {
     Relevance,
     Newest,
     Oldest,
+    /// Highest aesthetic score first (the engine uses the user's learned taste when it can).
+    Best,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -122,6 +125,7 @@ struct Fields {
     gps: Field,
     faces: Field,
     stack: Field,
+    aesthetic: Field,
 }
 
 fn schema() -> (Schema, Fields) {
@@ -158,7 +162,8 @@ fn schema() -> (Schema, Fields) {
         size: b.add_u64_field("size", num.clone()),
         gps: b.add_bool_field("gps", num.clone()),
         faces: b.add_u64_field("faces", num.clone()),
-        stack: b.add_u64_field("stack", num),
+        stack: b.add_u64_field("stack", num.clone()),
+        aesthetic: b.add_f64_field("aesthetic", num),
     };
     (b.build(), fields)
 }
@@ -262,6 +267,10 @@ impl PhotoIndex {
                 let collector = top.order_by_fast_field::<DateTime>("taken", order);
                 searcher.search(&query, &collector)?.into_iter().map(|(_, a)| a).collect()
             }
+            Sort::Best => {
+                let collector = top.order_by_fast_field::<f64>("aesthetic", Order::Desc);
+                searcher.search(&query, &collector)?.into_iter().map(|(_, a)| a).collect()
+            }
         };
         let hits = addrs.into_iter().map(|a| self.hit(&searcher, a)).collect::<Result<_>>()?;
         Ok(SearchResults { total, hits })
@@ -281,6 +290,10 @@ impl PhotoIndex {
             Sort::Newest | Sort::Oldest => {
                 let order = if sort == Sort::Newest { Order::Desc } else { Order::Asc };
                 let collector = top.order_by_fast_field::<DateTime>("taken", order);
+                searcher.search(&query, &collector)?.into_iter().map(|(_, a)| a).collect()
+            }
+            Sort::Best => {
+                let collector = top.order_by_fast_field::<f64>("aesthetic", Order::Desc);
                 searcher.search(&query, &collector)?.into_iter().map(|(_, a)| a).collect()
             }
         };
@@ -415,6 +428,9 @@ impl PhotoIndex {
             text.push(name);
         }
         doc.add_u64(f.faces, rec.faces.into());
+        if let Some(a) = rec.aesthetic {
+            doc.add_f64(f.aesthetic, a.into());
+        }
         if let Some(stack) = rec.stack {
             doc.add_u64(f.stack, stack as u64);
         }
@@ -510,6 +526,8 @@ mod tests {
             faces: 0,
             stack: None,
             stack_cover: false,
+            aesthetic: None,
+            suggested_rating: None,
             indexed_at: 0,
         }
     }
@@ -595,6 +613,20 @@ mod tests {
             (r#"year:2024 camera:"/FUJIFILM/X-T5" focal:[70 TO 200] -tag:x"#.into(), "dog on a beach".into())
         );
         assert_eq!(split(":) smile"), ("".into(), ":) smile".into()));
+    }
+
+    #[test]
+    fn best_first_and_aesthetic_filter() {
+        let mut idx = PhotoIndex::in_memory().unwrap();
+        let mut recs: Vec<PhotoRecord> = (1..=3).map(|i| rec(i, &format!("/{i}.jpg"), PhotoMeta::default())).collect();
+        recs[0].aesthetic = Some(4.5);
+        recs[1].aesthetic = Some(6.2);
+        idx.upsert(&recs).unwrap();
+        idx.commit().unwrap();
+        let best = idx.ordered_ids("", Sort::Best).unwrap();
+        assert_eq!(best[..2], [2, 1], "scored photos best first");
+        assert_eq!(best.len(), 3, "unscored photos are still listed");
+        assert_eq!(ids(&idx, "aesthetic:>=6"), vec![2]);
     }
 
     #[test]
