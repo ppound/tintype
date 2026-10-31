@@ -473,6 +473,25 @@ fn folder_segments(photo: &Path) -> Vec<String> {
     out
 }
 
+/// The values along a facet path, as written: `/NIKKOR Z 24-70mm f\/4 S` (a
+/// slash inside a value is escaped) gives `["NIKKOR Z 24-70mm f/4 S"]`.
+pub fn facet_segments(path: &str) -> Vec<String> {
+    match Facet::from_text(path) {
+        Ok(f) => f.to_path().into_iter().map(str::to_string).collect(),
+        Err(_) => path.split('/').filter(|s| !s.is_empty()).map(str::to_string).collect(),
+    }
+}
+
+/// The facet path for these values, escaping any slash inside them.
+pub fn facet_path<S: AsRef<str>>(segments: &[S]) -> String {
+    Facet::from_path(segments.iter().map(AsRef::as_ref)).to_string()
+}
+
+/// A query term that filters on one facet path, quoted for the query parser.
+pub fn facet_filter(field: &str, path: &str) -> String {
+    format!("{field}:\"{}\"", path.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 /// Splits a smart search into (field terms, description): `dog on a beach
 /// year:2024 camera:"/FUJIFILM"` gives `year:2024 camera:"/FUJIFILM"` and
 /// `dog on a beach`. Quotes and `[a TO b]` ranges stay with their field.
@@ -546,6 +565,7 @@ mod tests {
         let nikon = PhotoMeta {
             make: Some("NIKON CORPORATION".into()),
             model: Some("NIKON Z 6".into()),
+            lens: Some("NIKKOR Z 24-70mm f/4 S".into()),
             iso: Some(200),
             f_number: Some(8.0),
             taken: chrono::NaiveDate::from_ymd_opt(2021, 8, 2).unwrap().and_hms_opt(17, 0, 0),
@@ -667,6 +687,20 @@ mod tests {
         assert_eq!(months, vec![FacetCount { path: "/2023/05".into(), count: 1 }]);
         assert_eq!(idx.facets("", "date", "2023").unwrap(), months, "leading slash optional");
         assert!(matches!(idx.facets("", "nope", "/"), Err(Error::UnknownFacet(_))));
+    }
+
+    #[test]
+    fn facet_values_with_slashes() {
+        let idx = sample();
+        let lenses = idx.facets("", "lenses", "/").unwrap();
+        let nikkor = lenses.iter().find(|f| f.path.contains("NIKKOR")).unwrap();
+        assert_eq!(nikkor.path, r"/NIKKOR Z 24-70mm f\/4 S");
+        assert_eq!(facet_segments(&nikkor.path), ["NIKKOR Z 24-70mm f/4 S"]);
+        assert_eq!(facet_path(&facet_segments(&nikkor.path)), nikkor.path);
+        let q = facet_filter("lenses", &nikkor.path);
+        assert_eq!(idx.search(&q, Sort::Newest, 10, 0).unwrap().total, 1);
+        assert_eq!(facet_segments("/FUJIFILM/X-T5"), ["FUJIFILM", "X-T5"]);
+        assert_eq!(facet_path::<&str>(&[]), "/");
     }
 
     #[test]

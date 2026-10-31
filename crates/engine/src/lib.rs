@@ -24,7 +24,9 @@ use tintype_jobs::{ScanOptions, SyncMode};
 
 pub use tintype_catalog::{FaceGroup, FaceInfo, Person, PhotoRecord};
 pub use tintype_codecs::{self as codecs, Rgba, ThumbCache, decode_preview};
-pub use tintype_index::{FACET_FIELDS, FacetCount, Hit, SearchResults, Sort, split_smart};
+pub use tintype_index::{
+    FACET_FIELDS, FacetCount, Hit, SearchResults, Sort, facet_filter, facet_path, facet_segments, split_smart,
+};
 pub use tintype_jobs::{AnalyzeReport, FacesReport, ScanProgress, ScanReport, SidecarReport, face_crop_path};
 pub use tintype_meta::FileKind;
 
@@ -253,9 +255,11 @@ pub struct Stats {
     pub folder_kinds: Vec<Option<Vec<FileKind>>>,
     /// Photos not yet fully analyzed (smart search, sharpness, aesthetic score)...
     pub unanalyzed: u64,
-    /// ...and the passes over photos that this takes (a photo may need two):
-    /// `Analyze` counts its `remaining` in these.
-    pub analysis_steps: u64,
+    /// ...which takes two passes, one after the other: photos still to embed
+    /// for smart search, then photos still to measure for quality. `Analyze`
+    /// counts its `remaining` as the sum of the two.
+    pub needs_smart_search: u64,
+    pub needs_quality: u64,
     /// Smart search models are downloaded; if not, `smart_download_bytes` will be.
     pub smart_ready: bool,
     pub smart_download_bytes: u64,
@@ -488,8 +492,8 @@ impl Engine {
                     SHARPNESS_VERSION,
                     self.aesthetic_version()?,
                 )?,
-                analysis_steps: self.catalog.count_needing_analysis(ANALYSIS_VERSION)?
-                    + self.catalog.count_needing_quality(SHARPNESS_VERSION, self.aesthetic_version()?)?,
+                needs_smart_search: self.catalog.count_needing_analysis(ANALYSIS_VERSION)?,
+                needs_quality: self.catalog.count_needing_quality(SHARPNESS_VERSION, self.aesthetic_version()?)?,
                 smart_ready: SMART_MODELS.iter().all(|m| self.models.is_installed(m)),
                 smart_download_bytes: SMART_MODELS
                     .iter()

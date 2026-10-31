@@ -14,7 +14,7 @@ use eframe::egui::{
 use serde::{Deserialize, Serialize};
 use tintype_engine::{
     Command, Engine, Event, FacetCount, FileKind, Hit, PhotoRecord, PhotoRef, Response, ScanProgress, Sort, Stats,
-    split_smart,
+    facet_filter, facet_path, facet_segments, split_smart,
 };
 
 use crate::backend::{Backend, Job, Msg, Reply};
@@ -251,7 +251,8 @@ impl TintypeApp {
     fn full_query(&self) -> String {
         let mut q = self.query.trim().to_string();
         for (field, path) in &self.filters {
-            q.push_str(&format!(" {field}:\"{}\"", path.replace('"', "\\\"")));
+            q.push(' ');
+            q.push_str(&facet_filter(field, path));
         }
         if let Some((stack, _)) = self.open_stack {
             q.push_str(&format!(" stack:{stack}"));
@@ -828,11 +829,11 @@ impl TintypeApp {
                                 chosen = Some((field, None));
                             }
                             // Breadcrumb: each ancestor is a link back up.
-                            let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
-                            for (i, _) in segments.iter().enumerate() {
-                                let prefix = format!("/{}", segments[..=i].join("/"));
+                            let segments = facet_segments(path);
+                            for i in 0..segments.len() {
+                                let prefix = facet_path(&segments[..=i]);
                                 ui.weak("›");
-                                let label = facet_label(field, &format!("/{}", segments[..i].join("/")), &prefix);
+                                let label = facet_label(field, &facet_path(&segments[..i]), &prefix);
                                 if i + 1 == segments.len() {
                                     ui.label(RichText::new(label).strong());
                                 } else if ui.link(label).clicked() {
@@ -1346,8 +1347,11 @@ fn facet_title(field: &str) -> &'static str {
 
 /// How a facet value reads in the sidebar, relative to `parent`.
 fn facet_label(field: &str, parent: &str, path: &str) -> String {
-    let rel = path.strip_prefix(parent).unwrap_or(path).trim_start_matches('/');
-    if field == "date" && parent.trim_start_matches('/').len() == 4 {
+    let segments = facet_segments(path);
+    let parent = facet_segments(parent);
+    let rel = segments.strip_prefix(parent.as_slice()).unwrap_or(&segments).join("/");
+    let rel = rel.as_str();
+    if field == "date" && parent.len() == 1 && parent[0].len() == 4 {
         // A month under a year.
         const MONTHS: [&str; 12] = [
             "January",
@@ -1472,6 +1476,7 @@ mod tests {
         assert_eq!(facet_label("date", "/", "/2024"), "2024");
         assert_eq!(facet_label("ext", "/", "/raf"), "RAF");
         assert_eq!(facet_label("camera", "/FUJIFILM", "/FUJIFILM/X-T5"), "X-T5");
+        assert_eq!(facet_label("lenses", "/", r"/NIKKOR Z 24-70mm f\/4 S"), "NIKKOR Z 24-70mm f/4 S");
         assert_eq!(camera_name(Some("Canon"), Some("Canon EOS R5")).as_deref(), Some("Canon EOS R5"));
         assert_eq!(camera_name(Some("FUJIFILM"), Some("X-T5")).as_deref(), Some("FUJIFILM X-T5"));
     }

@@ -20,10 +20,28 @@ pub(super) struct SmartState {
     analyzing: Option<AnalyzeProgress>,
 }
 
+/// Analysis runs two passes, one after the other: smart search, then quality.
 struct AnalyzeProgress {
-    total: u64,
+    /// Photos each pass had to do when it started...
+    smart: u64,
+    quality: u64,
+    /// ...and photos done, counting through both passes.
     done: u64,
     stop: bool,
+}
+
+impl AnalyzeProgress {
+    /// "Smart search: 1,200 of 36,624 photos (step 1 of 2)", and the fraction done overall.
+    fn status(&self, done: u64) -> (String, f32) {
+        let fraction = done as f32 / (self.smart + self.quality).max(1) as f32;
+        let (what, done, of, step) = if done < self.smart || self.quality == 0 {
+            ("Analyzing photos for smart search", done.min(self.smart), self.smart, 1)
+        } else {
+            ("Measuring photo quality", (done - self.smart).min(self.quality), self.quality, 2)
+        };
+        let step = if self.smart > 0 && self.quality > 0 { format!("  (step {step} of 2)") } else { String::new() };
+        (format!("{what}: {} of {}{step}", thousands(done), thousands(of)), fraction.min(1.0))
+    }
 }
 
 impl SmartState {
@@ -39,8 +57,8 @@ impl TintypeApp {
         if self.smart.analyzing.is_some() || self.scan.is_some() {
             return;
         }
-        let total = self.stats.as_ref().map_or(1, |s| s.analysis_steps.max(1));
-        self.smart.analyzing = Some(AnalyzeProgress { total, done: 0, stop: false });
+        let (smart, quality) = self.stats.as_ref().map_or((0, 0), |s| (s.needs_smart_search, s.needs_quality));
+        self.smart.analyzing = Some(AnalyzeProgress { smart, quality, done: 0, stop: false });
         self.scan = Some(ScanState { label: "Preparing smart search…".into(), fraction: None });
         self.backend.send(Job::Analyze, Command::Analyze { batch: ANALYZE_BATCH });
     }
@@ -50,9 +68,9 @@ impl TintypeApp {
         let (Event::Analyze { done, .. }, Some(scan), Some(a)) = (event, &mut self.scan, &self.smart.analyzing) else {
             return false;
         };
-        let done = a.done + done;
-        scan.label = format!("Analyzing photos for smart search: {} of {}", thousands(done), thousands(a.total));
-        scan.fraction = Some(done as f32 / a.total as f32);
+        let (label, fraction) = a.status(a.done + done);
+        scan.label = label;
+        scan.fraction = Some(fraction);
         true
     }
 
@@ -63,11 +81,15 @@ impl TintypeApp {
                 let Some(a) = &mut self.smart.analyzing else { return true };
                 a.done += r.processed;
                 if r.cancelled || a.stop || r.remaining == 0 || r.processed == 0 {
-                    let done = a.done;
+                    let (status, _) = a.status(a.done);
                     self.smart.analyzing = None;
                     self.scan = None;
-                    let msg = format!("Analyzed {} photos for smart search", thousands(done));
-                    self.notify(if r.remaining > 0 { format!("{msg}. Paused.") } else { msg }, false);
+                    let msg = if r.remaining > 0 {
+                        format!("Analysis paused. {status}")
+                    } else {
+                        "Analysis finished: every photo is ready for smart search and quality sorting".to_string()
+                    };
+                    self.notify(msg, false);
                     self.refresh_stats();
                 } else {
                     self.backend.send(Job::Analyze, Command::Analyze { batch: ANALYZE_BATCH });
@@ -161,7 +183,18 @@ fn duration(secs: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::duration;
+    use super::{AnalyzeProgress, duration};
+
+    #[test]
+    fn analysis_shows_each_pass() {
+        let a = AnalyzeProgress { smart: 36_624, quality: 36_624, done: 0, stop: false };
+        assert_eq!(a.status(0).0, "Analyzing photos for smart search: 0 of 36,624  (step 1 of 2)");
+        let (label, fraction) = a.status(36_625);
+        assert_eq!(label, "Measuring photo quality: 1 of 36,624  (step 2 of 2)");
+        assert!((fraction - 0.5).abs() < 0.001);
+        let quality_only = AnalyzeProgress { smart: 0, quality: 10, done: 0, stop: false };
+        assert_eq!(quality_only.status(3).0, "Measuring photo quality: 3 of 10");
+    }
 
     #[test]
     fn durations_read_naturally() {
