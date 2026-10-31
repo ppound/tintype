@@ -20,7 +20,7 @@
 //! field terms, which still filter here via [`PhotoIndex::matching_ids`], from
 //! the description, which is matched against image embeddings.
 
-use std::path::{Component, Path};
+use std::path::{Component, Path, Prefix};
 
 use chrono::Datelike;
 use serde::Serialize;
@@ -31,7 +31,7 @@ use tantivy::{DateTime, DocAddress, Index, IndexReader, IndexWriter, Order, Relo
 use tintype_catalog::PhotoRecord;
 
 /// Bump whenever the schema or the way documents are built changes.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 const VERSION_FILE: &str = "tintype-schema-version";
 const WRITER_HEAP_BYTES: usize = 128 * 1024 * 1024;
 
@@ -318,16 +318,7 @@ impl PhotoIndex {
         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
             doc.add_facet(f.ext, Facet::from_path([ext.to_ascii_lowercase()]));
         }
-        let folders: Vec<String> = path
-            .parent()
-            .into_iter()
-            .flat_map(Path::components)
-            .filter_map(|c| match c {
-                Component::Prefix(p) => Some(p.as_os_str().to_string_lossy().into_owned()),
-                Component::Normal(n) => Some(n.to_string_lossy().into_owned()),
-                _ => None,
-            })
-            .collect();
+        let folders = folder_segments(path);
         if !folders.is_empty() {
             doc.add_facet(f.folder, Facet::from_path(folders));
         }
@@ -403,6 +394,28 @@ impl PhotoIndex {
     pub fn tantivy(&self) -> &Index {
         &self.index
     }
+}
+
+/// The folder facet path of a photo: one segment per folder, a drive (`C:`),
+/// or a network server and share (`\\nas\photos` gives `nas`, `photos`), so
+/// no segment holds a path separator.
+fn folder_segments(photo: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    for c in photo.parent().into_iter().flat_map(Path::components) {
+        match c {
+            Component::Prefix(p) => match p.kind() {
+                Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => {
+                    out.push(server.to_string_lossy().into_owned());
+                    out.push(share.to_string_lossy().into_owned());
+                }
+                Prefix::Disk(d) | Prefix::VerbatimDisk(d) => out.push(format!("{}:", d as char)),
+                _ => out.push(p.as_os_str().to_string_lossy().replace(['\\', '/'], "")),
+            },
+            Component::Normal(n) => out.push(n.to_string_lossy().into_owned()),
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Splits a smart search into (field terms, description): `dog on a beach
@@ -521,6 +534,15 @@ mod tests {
         assert_eq!(ids(&idx, "camera:\"/Canon\""), vec![1]);
         assert_eq!(ids(&idx, "canon nikon"), Vec::<i64>::new(), "terms are ANDed");
         assert!(matches!(idx.search("iso:>>", Sort::Relevance, 10, 0), Err(Error::Query(_))));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn folder_segments_have_no_separators() {
+        let seg = |p: &str| folder_segments(Path::new(p));
+        assert_eq!(seg(r"C:\Users\me\a.jpg"), ["C:", "Users", "me"]);
+        assert_eq!(seg(r"\\nas\photos 2\2026\a.jpg"), ["nas", "photos 2", "2026"]);
+        assert_eq!(seg(r"\\?\UNC\nas\share\a.jpg"), ["nas", "share"]);
     }
 
     #[test]

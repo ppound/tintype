@@ -21,13 +21,18 @@ pub fn run(library: Option<PathBuf>) -> Result<(), String> {
         view: std::env::var("TINTYPE_SCREENSHOT_VIEW").ok(),
         smart_query: std::env::var("TINTYPE_SCREENSHOT_SMART").ok(),
     });
-    let options = eframe::NativeOptions {
+    let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Tintype")
             .with_inner_size([1360.0, 860.0])
             .with_min_inner_size([760.0, 480.0]),
         ..Default::default()
     };
+    if screenshot.is_some() {
+        // Start from defaults and leave the user's window and panel sizes alone.
+        options.persist_window = false;
+        options.persistence_path = Some(std::env::temp_dir().join("tintype-screenshot-state"));
+    }
     eframe::run_native(
         "Tintype",
         options,

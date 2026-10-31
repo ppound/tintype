@@ -203,6 +203,8 @@ impl TintypeApp {
         app.refresh_stats();
         app.backend.send(Job::Settings, Command::Settings { write_sidecars: None });
         app.search();
+        // After the first results: pick up sidecars edited by other apps since the last scan.
+        app.backend.send(Job::SyncSidecars, Command::SyncSidecars);
         app
     }
 
@@ -422,6 +424,15 @@ impl TintypeApp {
             }
 
             (Job::Stats, Ok(Response::Stats(s))) => self.stats = Some(s),
+            (Job::SyncSidecars, Ok(Response::Sidecars(s))) => {
+                if s.imported > 0 {
+                    self.notify(format!("Read {} updated .xmp sidecars", thousands(s.imported)), false);
+                    self.search();
+                    if let Some(i) = self.selected {
+                        self.select(i);
+                    }
+                }
+            }
             (Job::Settings, Ok(Response::Settings { write_sidecars, sidecars })) => {
                 self.write_sidecars = Some(write_sidecars);
                 if let Some(s) = sidecars.filter(|s| s.written + s.failed > 0) {
@@ -755,7 +766,7 @@ impl TintypeApp {
                 let mut row = |label: &str, value: Option<String>| {
                     if let Some(v) = value {
                         ui.weak(label);
-                        ui.label(v);
+                        ui.add(egui::Label::new(v).wrap());
                         ui.end_row();
                     }
                 };
@@ -809,8 +820,8 @@ impl TintypeApp {
             CollapsingHeader::new(format!("All metadata ({})", p.meta.fields.len())).show(ui, |ui| {
                 egui::Grid::new("exif").num_columns(2).striped(true).show(ui, |ui| {
                     for (k, v) in &p.meta.fields {
-                        ui.weak(k);
-                        ui.label(v);
+                        ui.add(egui::Label::new(RichText::new(k).weak()).truncate()).on_hover_text(k);
+                        ui.add(egui::Label::new(v).wrap());
                         ui.end_row();
                     }
                 });
@@ -1001,7 +1012,9 @@ impl TintypeApp {
             self.open_person(first);
         }
         let Some(s) = &mut self.screenshot else { return };
-        let settled = s.frames > 90 && self.thumbs.queued() == 0 && self.scan.is_none();
+        // A selected photo also waits for its details (a busy engine can take a while), up to 30 s.
+        let detail_ready = self.selected.is_none() || self.detail.is_some() || s.frames > 1800;
+        let settled = s.frames > 90 && detail_ready && self.thumbs.queued() == 0 && self.scan.is_none();
         if s.selected && settled && !s.requested {
             s.requested = true;
             let (path, saved) = (s.plan.path.clone(), s.saved.clone());
@@ -1076,7 +1089,7 @@ impl eframe::App for TintypeApp {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        // Screenshot runs change settings for the shot; don't keep them.
+        // Screenshot runs change settings for the shot; don't keep them (see `run`).
         if self.screenshot.is_none() {
             eframe::set_value(storage, eframe::APP_KEY, &self.settings);
         }

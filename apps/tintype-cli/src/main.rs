@@ -386,6 +386,7 @@ fn print_response(response: &Response) {
             }
         }
         Response::Changed { photos } => println!("updated {photos} photos"),
+        Response::Sidecars(s) => println!("sidecars: {} read, {} written, {} failed", s.imported, s.written, s.failed),
         Response::Settings { write_sidecars, sidecars } => {
             let state = if *write_sidecars { "on" } else { "off (read only)" };
             println!("sidecars  {state}");

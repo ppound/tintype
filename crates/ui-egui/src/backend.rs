@@ -25,6 +25,7 @@ pub enum Job {
     PeopleEdit,
     Analyze,
     Settings,
+    SyncSidecars,
 }
 
 pub struct Reply {

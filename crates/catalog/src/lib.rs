@@ -105,6 +105,15 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE photos ADD COLUMN sidecar_size INTEGER;
     CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 "#,
+    r#"
+    -- Network paths were stored as \\?\UNC\server\share\...; store \\server\share\...
+    UPDATE OR IGNORE photos SET path = '\\' || substr(path, 9) WHERE path LIKE '\\?\UNC\%';
+    UPDATE OR IGNORE roots SET path = '\\' || substr(path, 9) WHERE path LIKE '\\?\UNC\%';
+"#,
+    r#"
+    -- Photos changed in the catalog whose search index entry may not be updated yet.
+    CREATE TABLE index_pending (photo_id INTEGER PRIMARY KEY);
+"#,
 ];
 
 /// A photo as produced by a scan, before it has an id.
@@ -230,6 +239,7 @@ impl Catalog {
                 ids.push(id);
             }
         }
+        mark_index_pending(&tx, &ids)?;
         tx.commit()?;
         Ok(ids)
     }
@@ -330,6 +340,32 @@ impl Catalog {
         Ok(roots)
     }
 
+    /// Photos changed by batch work (scans, sidecar imports) that the search
+    /// index may not have caught up with, e.g. because the app was closed midway.
+    pub fn index_pending(&self) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare("SELECT photo_id FROM index_pending ORDER BY photo_id")?;
+        let ids = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        Ok(ids)
+    }
+
+    /// Call after the index has committed `ids` (`None`: everything).
+    pub fn clear_index_pending(&mut self, ids: Option<&[i64]>) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        match ids {
+            None => {
+                tx.execute("DELETE FROM index_pending", [])?;
+            }
+            Some(ids) => {
+                let mut stmt = tx.prepare_cached("DELETE FROM index_pending WHERE photo_id = ?1")?;
+                for id in ids {
+                    stmt.execute([id])?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     fn tags(&self, id: i64) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare_cached("SELECT tag FROM photo_tags WHERE photo_id = ?1 ORDER BY tag")?;
         let tags = stmt.query_map([id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
@@ -371,6 +407,14 @@ fn read_row(r: &Row) -> rusqlite::Result<RawRecord> {
         },
         meta_json: r.get(5)?,
     })
+}
+
+fn mark_index_pending(tx: &rusqlite::Transaction, ids: &[i64]) -> Result<()> {
+    let mut stmt = tx.prepare_cached("INSERT OR IGNORE INTO index_pending (photo_id) VALUES (?1)")?;
+    for id in ids {
+        stmt.execute([id])?;
+    }
+    Ok(())
 }
 
 /// A 64-digit hex hash as bytes (kept compact: the scan holds one per photo).
@@ -478,6 +522,35 @@ mod tests {
         let cat = Catalog::open_in_memory().unwrap();
         assert!(matches!(cat.set_rating(1, Some(6)), Err(Error::BadRating(6))));
         assert!(!cat.set_rating(1, Some(3)).unwrap(), "missing photo");
+    }
+
+    #[test]
+    fn index_pending_until_cleared() {
+        let mut cat = Catalog::open_in_memory().unwrap();
+        let ids = cat.upsert_many(&[photo("/a.jpg", 1), photo("/b.jpg", 1)]).unwrap();
+        assert_eq!(cat.index_pending().unwrap(), ids);
+        cat.clear_index_pending(Some(&ids[..1])).unwrap();
+        assert_eq!(cat.index_pending().unwrap(), ids[1..]);
+        cat.clear_index_pending(None).unwrap();
+        assert!(cat.index_pending().unwrap().is_empty());
+    }
+
+    #[test]
+    fn verbatim_network_paths_are_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.db");
+        let cat = Catalog::open(&path).unwrap();
+        let mut cat = cat;
+        cat.upsert_many(&[photo(r"\\?\UNC\nas\share\a.jpg", 1), photo(r"C:\b.jpg", 1)]).unwrap();
+        cat.add_roots(&[r"\\?\UNC\nas\share".into()]).unwrap();
+        // Back to the schema before the path fix (and the later index_pending table).
+        cat.conn.execute("DROP TABLE index_pending", []).unwrap();
+        cat.conn.pragma_update(None, "user_version", 7).unwrap();
+        drop(cat);
+        let cat = Catalog::open(&path).unwrap();
+        assert!(cat.get_by_path(r"\\nas\share\a.jpg").unwrap().is_some());
+        assert!(cat.get_by_path(r"C:\b.jpg").unwrap().is_some());
+        assert_eq!(cat.roots().unwrap(), vec![r"\\nas\share".to_string()]);
     }
 
     #[test]

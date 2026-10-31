@@ -61,6 +61,7 @@ impl Catalog {
             "UPDATE photos SET sidecar_mtime_ns = ?2, sidecar_size = ?3 WHERE id = ?1",
             params![photo_id, stamp.mtime_ns, stamp.size as i64],
         )?;
+        crate::mark_index_pending(&tx, &[photo_id])?;
         tx.commit()?;
         Ok(())
     }

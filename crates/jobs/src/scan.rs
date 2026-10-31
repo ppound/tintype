@@ -111,7 +111,7 @@ pub fn scan(
     let roots = roots
         .iter()
         .map(|r| {
-            let canonical = dunce::canonicalize(r).map_err(|source| Error::Root { path: r.clone(), source })?;
+            let canonical = normalize_path(r).map_err(|source| Error::Root { path: r.clone(), source })?;
             if canonical.is_dir() { Ok(canonical) } else { Err(Error::NotADirectory(r.clone())) }
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -236,6 +236,18 @@ pub fn scan(
 
     report.elapsed_ms = started.elapsed().as_millis() as u64;
     Ok(report)
+}
+
+/// The one spelling under which a file is cataloged: absolute, symlinks and
+/// mapped drives resolved, and without Windows' `\\?\` prefix (which
+/// `canonicalize` adds and `dunce` only removes for drive letters):
+/// `Y:\x` on a mapped NAS share becomes `\\server\share\x`.
+pub fn normalize_path(path: &Path) -> std::io::Result<PathBuf> {
+    let canonical = dunce::canonicalize(path)?;
+    Ok(match canonical.to_str().and_then(|s| s.strip_prefix(r"\\?\UNC\")) {
+        Some(rest) => PathBuf::from(format!(r"\\{rest}")),
+        None => canonical,
+    })
 }
 
 /// Hidden folders and NAS/OS thumbnail caches.

@@ -41,7 +41,7 @@ photos around, a lost catalog, or another app. Tintype only touches the
 properties it owns (`xmp:Rating`, `dc:subject`, `Iptc4xmpExt:PersonInImage`)
 and keeps everything else in an existing sidecar as it was.
 
-- Scans read sidecars that changed outside Tintype; the sidecar wins. Existing
+- Scans, and starting the app, read sidecars that changed outside Tintype; the sidecar wins. Existing
   PhotoStat sidecars are imported this way, people included (as names in the
   photo: sidecars don't say which face is whom).
 - Edits in Tintype are written back right away. Sidecars are only created for

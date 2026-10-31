@@ -6,6 +6,9 @@
 //! photo's sidecar is rewritten after every edit in Tintype, and created for
 //! photos that have metadata but no sidecar yet. Photos are never touched.
 
+use std::collections::HashMap;
+use std::ffi::OsString;
+use std::fs::Metadata;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -37,9 +40,26 @@ impl SidecarReport {
 
 /// The sidecar's current stamp, or `None` if it doesn't exist.
 fn stamp(photo: &Path) -> Option<SidecarStamp> {
-    let md = std::fs::metadata(xmp::sidecar_path(photo)).ok()?;
+    stamp_of(&std::fs::metadata(xmp::sidecar_path(photo)).ok()?)
+}
+
+fn stamp_of(md: &Metadata) -> Option<SidecarStamp> {
     let mtime_ns = md.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_nanos() as i64;
     Some(SidecarStamp { mtime_ns, size: md.len() })
+}
+
+/// Stamps of every `.xmp` in a folder, from one listing: on a network share
+/// that is one request per folder instead of one per photo.
+fn folder_stamps(dir: &Path) -> Option<HashMap<OsString, SidecarStamp>> {
+    let mut out = HashMap::new();
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let name = entry.file_name();
+        let is_xmp = Path::new(&name).extension().is_some_and(|e| e.eq_ignore_ascii_case("xmp"));
+        if is_xmp && let Some(stamp) = entry.metadata().ok().as_ref().and_then(stamp_of) {
+            out.insert(name, stamp);
+        }
+    }
+    Some(out)
 }
 
 /// How [`sync_sidecars`] treats sidecars nobody else changed.
@@ -68,11 +88,21 @@ pub fn sync_sidecars(
         .filter(|(_, (path, _))| roots.iter().any(|r| Path::new(path).starts_with(r)))
         .map(|(id, (path, recorded))| (id, path, recorded))
         .collect();
-    photos.sort_by_key(|(id, ..)| *id);
+    // By folder, so each folder is listed once.
+    photos.sort_by(|a, b| a.1.cmp(&b.1));
+    let mut listing: Option<(PathBuf, Option<HashMap<OsString, SidecarStamp>>)> = None;
     let mut report = SidecarReport::default();
     for (id, path, recorded) in photos {
         let photo = Path::new(&path);
-        let current = stamp(photo);
+        let dir = photo.parent().unwrap_or(Path::new(""));
+        if listing.as_ref().is_none_or(|(d, _)| d != dir) {
+            listing = Some((dir.to_path_buf(), folder_stamps(dir)));
+        }
+        let sidecar_name = xmp::sidecar_path(photo).file_name().map(OsString::from);
+        let current = match (&listing, sidecar_name) {
+            (Some((_, Some(stamps))), Some(name)) => stamps.get(&name).copied(),
+            _ => stamp(photo),
+        };
         if current.is_some() && current != recorded {
             report.add(import(catalog, id, photo)?);
             continue;
@@ -239,6 +269,15 @@ mod tests {
         assert_eq!(cat.get(ida).unwrap().unwrap().rating, Some(5));
 
         assert_eq!(std::fs::read(&a).unwrap(), photo_bytes, "the photo itself is untouched");
+    }
+
+    #[test]
+    fn folder_listing_matches_single_stat() {
+        let dir = tempfile::tempdir().unwrap();
+        let photo = dir.path().join("a.JPG");
+        xmp::write_sidecar(&photo, &sc(Some(1), &[], &[])).unwrap();
+        let listed = folder_stamps(dir.path()).unwrap();
+        assert_eq!(listed.get(&OsString::from("a.JPG.xmp")).copied(), stamp(&photo));
     }
 
     #[test]

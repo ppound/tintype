@@ -154,6 +154,9 @@ pub enum Command {
     DeletePerson {
         person: i64,
     },
+    /// Read sidecars changed outside Tintype in every library folder (and, if
+    /// writing is on, create missing ones). Scans do this for the folders they scan.
+    SyncSidecars,
     /// Read or change library settings; `None` leaves a setting as it is.
     Settings {
         /// Keep ratings, tags and people in `photo.jpg.xmp` sidecars next to the photos.
@@ -208,6 +211,7 @@ pub enum Response {
     Changed {
         photos: u64,
     },
+    Sidecars(SidecarReport),
     Settings {
         write_sidecars: bool,
         /// What turning sidecar writing on just did, if it was turned on.
@@ -311,6 +315,13 @@ impl Engine {
         if fresh || engine.index.doc_count() != engine.catalog.count()? {
             tracing::info!(fresh, "rebuilding search index");
             engine.reindex(&mut |_| {})?;
+        } else {
+            // Finish what an interrupted scan or sidecar import left behind.
+            let pending = engine.catalog.index_pending()?;
+            if !pending.is_empty() {
+                tracing::info!(photos = pending.len(), "updating search index");
+                engine.reindex_photos(pending)?;
+            }
         }
         Ok(engine)
     }
@@ -358,7 +369,17 @@ impl Engine {
             Command::Facets { field, query, parent } => {
                 Ok(Response::Facets { counts: self.index.facets(&query, &field, &parent)? })
             }
+            // No sidecar check here: on a busy network share it would hold up
+            // the details panel. Startup and scans pick up outside edits.
             Command::Show { photo } => Ok(Response::Photo(Box::new(self.resolve(&photo)?))),
+            Command::SyncSidecars => {
+                let roots: Vec<PathBuf> =
+                    self.catalog.roots()?.into_iter().map(PathBuf::from).filter(|r| r.is_dir()).collect();
+                let mode = if self.write_sidecars_on()? { SyncMode::Write } else { SyncMode::ReadOnly };
+                let mut report = tintype_jobs::sync_sidecars(&mut self.catalog, &roots, mode)?;
+                self.reindex_photos(std::mem::take(&mut report.changed_photos))?;
+                Ok(Response::Sidecars(report))
+            }
             Command::Rate { photo, rating } => {
                 let id = self.resolve(&photo)?.id;
                 self.before_edit(&[id])?;
@@ -570,6 +591,9 @@ impl Engine {
     }
 
     fn reindex_photos(&mut self, mut ids: Vec<i64>) -> Result<u64> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
         ids.sort_unstable();
         ids.dedup();
         for &id in &ids {
@@ -578,6 +602,7 @@ impl Engine {
             }
         }
         self.index.commit()?;
+        self.catalog.clear_index_pending(Some(&ids))?;
         Ok(ids.len() as u64)
     }
 
@@ -606,6 +631,7 @@ impl Engine {
             }
         }
         self.index.commit()?;
+        self.catalog.clear_index_pending(Some(&report.changed_ids))?;
         Ok(report)
     }
 
@@ -636,6 +662,7 @@ impl Engine {
         index.upsert(&batch)?;
         done += batch.len() as u64;
         index.commit()?;
+        self.catalog.clear_index_pending(None)?;
         events(Event::Reindex { done, total });
         Ok(done)
     }
@@ -653,7 +680,7 @@ impl Engine {
             PhotoRef::Id(id) => self.catalog.get(*id)?,
             PhotoRef::Path(p) => {
                 // Catalog paths are canonical; accept relative or differently-spelled ones.
-                let canonical = dunce::canonicalize(p).unwrap_or_else(|_| p.clone());
+                let canonical = tintype_jobs::normalize_path(p).unwrap_or_else(|_| p.clone());
                 self.catalog.get_by_path(&canonical.display().to_string())?
             }
         };
@@ -799,6 +826,27 @@ mod tests {
         let on = Command::Settings { write_sidecars: Some(true) };
         engine.execute(on, &mut |_| {}).unwrap();
         assert_eq!(tintype_meta::xmp::read_sidecar(&b).unwrap().unwrap().rating, Some(1));
+    }
+
+    #[test]
+    fn interrupted_index_updates_finish_on_open() {
+        let photos = tempfile::tempdir().unwrap();
+        let a = photos.path().join("a.jpg");
+        JpegSpec::canon().write(&a);
+        let lib = tempfile::tempdir().unwrap();
+        let mut engine = Engine::open(lib.path()).unwrap();
+        engine.execute(Command::Scan { roots: vec![photos.path().into()], hash: false }, &mut |_| {}).unwrap();
+        drop(engine);
+
+        // A sidecar import that reached the catalog but not the index (app closed midway).
+        let mut cat = Catalog::open(&lib.path().join("catalog.db")).unwrap();
+        let id = cat.get_by_path(&tintype_jobs::normalize_path(&a).unwrap().display().to_string()).unwrap().unwrap().id;
+        let sidecar = tintype_meta::xmp::Sidecar { tags: vec!["barn".into()], ..Default::default() };
+        cat.apply_sidecar(id, &sidecar, tintype_catalog::SidecarStamp { mtime_ns: 1, size: 1 }).unwrap();
+        drop(cat);
+
+        let mut engine = Engine::open(lib.path()).unwrap();
+        assert_eq!(hits(&mut engine, "tag:barn"), vec!["a.jpg"]);
     }
 
     #[test]
