@@ -62,7 +62,10 @@ pub struct Thumbs {
     seen_this_frame: HashSet<i64>,
     results: Receiver<(i64, Kind, Outcome)>,
     thumbs: HashMap<i64, Slot>,
-    preview: Option<(i64, Slot)>,
+    /// Large previews asked for this frame (the photo shown, and the next one
+    /// a slideshow loads ahead); the rest are dropped at the end of the frame.
+    previews: HashMap<i64, Slot>,
+    previews_seen: HashSet<i64>,
     faces: HashMap<i64, Slot>,
 }
 
@@ -86,7 +89,8 @@ impl Thumbs {
             seen_this_frame: HashSet::new(),
             results,
             thumbs: HashMap::new(),
-            preview: None,
+            previews: HashMap::new(),
+            previews_seen: HashSet::new(),
             faces: HashMap::new(),
         }
     }
@@ -113,8 +117,8 @@ impl Thumbs {
                 (Kind::Thumb, None) => {
                     self.thumbs.remove(&id);
                 }
-                (Kind::Preview, Some(slot)) if self.preview.as_ref().is_some_and(|(p, _)| *p == id) => {
-                    self.preview = Some((id, slot));
+                (Kind::Preview, Some(slot)) if self.previews.contains_key(&id) => {
+                    self.previews.insert(id, slot);
                 }
                 (Kind::Preview, _) => {}
                 (Kind::Face, Some(slot)) => {
@@ -132,6 +136,8 @@ impl Thumbs {
 
     /// Call once per frame after drawing: records what is on screen.
     pub fn end_frame(&mut self) {
+        let previews = std::mem::take(&mut self.previews_seen);
+        self.previews.retain(|id, _| previews.contains(id));
         let seen = std::mem::take(&mut self.seen_this_frame);
         if self.thumbs.len() > MAX_TEXTURES {
             self.thumbs.retain(|id, slot| seen.contains(id) || matches!(slot, Slot::Pending));
@@ -151,13 +157,15 @@ impl Thumbs {
         &self.thumbs[&id]
     }
 
-    /// The large preview of one photo; only one is kept at a time.
+    /// The large preview of a photo, requesting it if needed. Previews not
+    /// asked for again next frame are dropped.
     pub fn preview(&mut self, id: i64, path: &str) -> &Slot {
-        if self.preview.as_ref().is_none_or(|(p, _)| *p != id) {
+        self.previews_seen.insert(id);
+        if !self.previews.contains_key(&id) {
             self.request(Request { id, path: path.into(), kind: Kind::Preview });
-            self.preview = Some((id, Slot::Pending));
+            self.previews.insert(id, Slot::Pending);
         }
-        &self.preview.as_ref().expect("just set").1
+        &self.previews[&id]
     }
 
     /// The display crop of a face, requesting it if needed.
@@ -186,7 +194,7 @@ impl Thumbs {
     pub fn clear(&mut self) {
         self.queue.requests.lock().expect("queue lock").clear();
         self.thumbs.clear();
-        self.preview = None;
+        self.previews.clear();
     }
 
     fn request(&self, req: Request) {

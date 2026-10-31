@@ -21,8 +21,10 @@ use crate::backend::{Backend, Job, Msg, Reply};
 use crate::thumbs::{Slot, Thumbs};
 
 mod people;
+mod slideshow;
 mod smart;
 use people::PeopleState;
+use slideshow::Slideshow;
 use smart::SmartState;
 
 /// Upper bound on hits loaded into the grid.
@@ -53,11 +55,21 @@ struct Settings {
     smart: bool,
     /// The kinds of file last chosen when adding a folder.
     add_kinds: Vec<FileKind>,
+    /// Slideshow: seconds per photo, and whether the caption stays on screen.
+    slide_seconds: f32,
+    slide_caption: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { thumb_size: 160.0, sort: Sort::Newest, smart: false, add_kinds: FileKind::ALL.to_vec() }
+        Self {
+            thumb_size: 160.0,
+            sort: Sort::Newest,
+            smart: false,
+            add_kinds: FileKind::ALL.to_vec(),
+            slide_seconds: 5.0,
+            slide_caption: false,
+        }
     }
 }
 
@@ -97,7 +109,7 @@ pub struct ScreenshotPlan {
     pub path: PathBuf,
     /// Select this result index once results arrive.
     pub select: Option<usize>,
-    /// "loupe", "people" or "person" (the first person's page).
+    /// "loupe", "slideshow" (or "slideshow-keys", "slideshow-tags"), "stack", "people" or "person" (the first person's page).
     pub view: Option<String>,
     /// Run this smart search first (an empty string shows smart mode with no query).
     pub smart_query: Option<String>,
@@ -126,6 +138,8 @@ pub struct TintypeApp {
     open_stack: Option<(i64, u32)>,
     /// A folder picked to add, waiting for the user to choose its file kinds.
     adding_folder: Option<PathBuf>,
+    /// The full-screen slideshow, while it runs.
+    slideshow: Option<Slideshow>,
 
     query: String,
     /// The search box's widget id, for focusing it with Ctrl+F.
@@ -184,6 +198,7 @@ impl TintypeApp {
             pending_open: None,
             open_stack: None,
             adding_folder: None,
+            slideshow: None,
             query: String::new(),
             search_box: None,
             query_error: None,
@@ -539,6 +554,14 @@ impl TintypeApp {
     // ---- input ----------------------------------------------------------
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
+        if self.slideshow.is_some() {
+            self.slideshow_keys(ctx);
+            return;
+        }
+        if self.tab == Tab::Photos && ctx.input(|i| i.key_pressed(Key::F5)) {
+            self.start_slideshow(ctx);
+            return;
+        }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::F))
             && let Some(id) = self.search_box
         {
@@ -637,6 +660,14 @@ impl TintypeApp {
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 self.library_buttons(ui);
+                if ui
+                    .add_enabled(!self.results.is_empty(), Button::new("▶ Slideshow"))
+                    .on_hover_text("Show these photos full screen, from the selected one (F5)")
+                    .clicked()
+                {
+                    let ctx = ui.ctx().clone();
+                    self.start_slideshow(&ctx);
+                }
                 ui.add(egui::Slider::new(&mut self.settings.thumb_size, 96.0..=320.0).show_value(false))
                     .on_hover_text("Thumbnail size");
                 let before = self.settings.sort;
@@ -1144,8 +1175,11 @@ impl TintypeApp {
         }
 
         let name = Path::new(&hit.path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let caption =
-            format!("{name}   ·   {} of {}   ·   ← → to browse, F for faces, Esc for grid", i + 1, self.results.len());
+        let caption = format!(
+            "{name}   ·   {} of {}   ·   ← → to browse, F for faces, F5 for slideshow, Esc for grid",
+            i + 1,
+            self.results.len()
+        );
         painter.text(
             pos2(rect.center().x, rect.bottom() - 8.0),
             Align2::CENTER_BOTTOM,
@@ -1172,6 +1206,10 @@ impl TintypeApp {
             }
             match view.as_deref() {
                 Some("loupe") => self.view = View::Loupe,
+                Some(v) if v.starts_with("slideshow") => {
+                    self.start_slideshow(ctx);
+                    self.slideshow_panel(v.trim_start_matches("slideshow-"));
+                }
                 Some("stack") => {
                     let first_stack = self.results.iter().find(|h| h.stack_size > 1).map(|h| (h.stack, h.stack_size));
                     if let Some((Some(stack), n)) = first_stack {
@@ -1198,10 +1236,12 @@ impl TintypeApp {
         {
             self.open_person(first);
         }
+        let slide_shown = self.slide_shown();
         let Some(s) = &mut self.screenshot else { return };
         // A selected photo also waits for its details (a busy engine can take a while), up to 30 s.
         let detail_ready = self.selected.is_none() || self.detail.is_some() || s.frames > 1800;
         let settled = s.frames > 90 && detail_ready && self.thumbs.queued() == 0 && self.scan.is_none();
+        let settled = settled && (slide_shown || s.frames > 1800);
         if s.selected && settled && !s.requested {
             s.requested = true;
             let (path, saved) = (s.plan.path.clone(), s.saved.clone());
@@ -1238,6 +1278,13 @@ impl eframe::App for TintypeApp {
         }
         self.handle_keys(&ctx);
 
+        if self.slideshow.is_some() {
+            let frame = egui::Frame::NONE.fill(Color32::BLACK);
+            egui::CentralPanel::default().frame(frame).show(ui, |ui| self.slideshow_view(ui));
+            self.thumbs.end_frame();
+            self.screenshot_step(&ctx);
+            return;
+        }
         let empty_library = self.stats.as_ref().is_some_and(|s| s.photos == 0) && self.scan.is_none();
         self.add_folder_dialog(&ctx);
         egui::Panel::top("top").show(ui, |ui| self.top_bar(ui));

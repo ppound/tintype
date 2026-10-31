@@ -48,6 +48,10 @@ its own. Tintype reads photos where they are and never changes, moves or deletes
   count badge (the best rated, else the largest, else the latest edit). Click the badge,
   or **Show all** in the details, to see them all. Nothing on disk changes.
 - a full-size view: double-click or Enter to open, ← → to browse, Esc to go back
+- a full-screen **slideshow** of the results (the ▶ Slideshow button or F5), from the
+  selected photo. Space pauses, ← → browse, 1–5 rate (0 clears), T adds tags (with Tab
+  completion; `-tag` removes one), + − change the time per photo, I keeps the caption on
+  screen, H lists the keys and Esc leaves
 - details, a 1–5 star rating (or keys 0–5) and tags for the selected photo
 - **Rescan** to pick up new, changed and removed files in all your folders
 - a **People** tab: Tintype finds faces, groups the ones that look alike, and
@@ -243,7 +247,8 @@ The icon is drawn by `assets/icon/make_icon.py`.
 
 `TINTYPE_SCREENSHOT=out.png tintype` runs the app until thumbnails settle, saves
 a screenshot and exits. `TINTYPE_SCREENSHOT_SELECT=<n>` selects a result first,
-`TINTYPE_SCREENSHOT_VIEW=loupe` opens it full size (`stack`: opens the first stack), and
+`TINTYPE_SCREENSHOT_VIEW=loupe` opens it full size (`slideshow`, `slideshow-keys`,
+`slideshow-tags`: the slideshow, with its key list or tag box; `stack`: opens the first stack), and
 `TINTYPE_SCREENSHOT_SMART="dog on a beach"` runs a smart search, and
 `TINTYPE_SCREENSHOT_ADD=<folder>` opens the add-folder dialog.
 
