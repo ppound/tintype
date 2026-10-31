@@ -12,7 +12,9 @@ use tintype_meta::PhotoMeta;
 
 mod embeddings;
 mod faces;
+mod sidecars;
 pub use faces::{FaceGroup, FaceInfo, FaceRow, NewFace, Person, Suggestion};
+pub use sidecars::SidecarStamp;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -91,6 +93,18 @@ const MIGRATIONS: &[&str] = &[
     );
     ALTER TABLE photos ADD COLUMN analysis_version INTEGER NOT NULL DEFAULT 0;
 "#,
+    r#"
+    -- People named in a photo's XMP sidecar who aren't on a confirmed face.
+    CREATE TABLE photo_names (
+        photo_id INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
+        name     TEXT    NOT NULL,
+        PRIMARY KEY (photo_id, name)
+    );
+    -- The sidecar as Tintype last read or wrote it; NULL: none.
+    ALTER TABLE photos ADD COLUMN sidecar_mtime_ns INTEGER;
+    ALTER TABLE photos ADD COLUMN sidecar_size INTEGER;
+    CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+"#,
 ];
 
 /// A photo as produced by a scan, before it has an id.
@@ -108,12 +122,14 @@ pub struct NewPhoto {
 }
 
 /// What a scan needs to decide whether a file changed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fingerprint {
     pub id: i64,
     pub size: u64,
     pub mtime_ns: i64,
     pub meta_version: u32,
+    /// Content hash, if one was computed; lets a scan recognize moved files.
+    pub hash: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -164,7 +180,7 @@ impl Catalog {
 
     /// Fingerprints of every cataloged photo, keyed by path.
     pub fn fingerprints(&self) -> Result<HashMap<String, Fingerprint>> {
-        let mut stmt = self.conn.prepare("SELECT id, path, size, mtime_ns, meta_version FROM photos")?;
+        let mut stmt = self.conn.prepare("SELECT id, path, size, mtime_ns, meta_version, hash FROM photos")?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, String>(1)?,
@@ -173,6 +189,7 @@ impl Catalog {
                     size: r.get::<_, i64>(2)? as u64,
                     mtime_ns: r.get(3)?,
                     meta_version: r.get(4)?,
+                    hash: r.get::<_, Option<String>>(5)?.as_deref().and_then(parse_hash),
                 },
             ))
         })?;
@@ -239,6 +256,7 @@ impl Catalog {
         };
         raw.rec.tags = self.tags(id)?;
         (raw.rec.people, raw.rec.faces) = self.photo_people(id)?;
+        merge_names(&mut raw.rec.people, self.photo_names(id)?);
         Ok(Some(raw.finish()?))
     }
 
@@ -257,12 +275,14 @@ impl Catalog {
             tags.entry(id).or_default().push(tag);
         }
         let mut people = self.people_by_photo()?;
+        let mut names = self.photo_names_by_photo()?;
 
         let mut stmt = self.conn.prepare(&format!("{SELECT_PHOTO} ORDER BY id"))?;
         for row in stmt.query_map([], read_row)? {
             let mut raw = row?;
             raw.rec.tags = tags.remove(&raw.rec.id).unwrap_or_default();
             (raw.rec.people, raw.rec.faces) = people.remove(&raw.rec.id).unwrap_or_default();
+            merge_names(&mut raw.rec.people, names.remove(&raw.rec.id).unwrap_or_default());
             f(raw.finish()?);
         }
         Ok(())
@@ -353,12 +373,33 @@ fn read_row(r: &Row) -> rusqlite::Result<RawRecord> {
     })
 }
 
+/// A 64-digit hex hash as bytes (kept compact: the scan holds one per photo).
+fn parse_hash(hex: &str) -> Option<[u8; 32]> {
+    let mut out = [0u8; 32];
+    if hex.len() != 64 {
+        return None;
+    }
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(hex.get(2 * i..2 * i + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
 fn to_blob(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
 fn from_blob(b: &[u8]) -> Vec<f32> {
     b.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect()
+}
+
+/// Adds sidecar names to face names, sorted, without duplicates.
+fn merge_names(people: &mut Vec<String>, names: Vec<String>) {
+    if !names.is_empty() {
+        people.extend(names);
+        people.sort();
+        people.dedup();
+    }
 }
 
 fn unix_now() -> i64 {
@@ -402,7 +443,7 @@ mod tests {
         let mut cat = Catalog::open_in_memory().unwrap();
         let ids = cat.upsert_many(&[photo("/a.jpg", 1), photo("/b.jpg", 2)]).unwrap();
         let fps = cat.fingerprints().unwrap();
-        assert_eq!(fps["/b.jpg"], Fingerprint { id: ids[1], size: 100, mtime_ns: 1, meta_version: 1 });
+        assert_eq!(fps["/b.jpg"], Fingerprint { id: ids[1], size: 100, mtime_ns: 1, meta_version: 1, hash: None });
 
         cat.edit_tags(ids[0], &["x".into()], &[]).unwrap();
         cat.remove_many(&ids[..1]).unwrap();

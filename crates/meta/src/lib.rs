@@ -13,6 +13,8 @@ use chrono::{NaiveDate, NaiveDateTime};
 use exif::{Exif, Field, In, Tag, Value};
 use serde::{Deserialize, Serialize};
 
+pub mod xmp;
+
 /// File extensions (lowercase) that the scanner treats as photos.
 pub const PHOTO_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "jpe", "tif", "tiff", "png", "webp", "heic", "heif", "avif", // common

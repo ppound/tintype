@@ -13,12 +13,12 @@ use tintype_catalog::Catalog;
 use tintype_faces::{FACES_VERSION, FaceAnalyzer};
 use tintype_index::PhotoIndex;
 use tintype_infer::{ModelSpec, ModelStore, SFACE, SIGLIP_TEXT, SIGLIP_TOKENIZER, SIGLIP_VISION, YUNET};
-use tintype_jobs::ScanOptions;
+use tintype_jobs::{ScanOptions, SyncMode};
 
 pub use tintype_catalog::{FaceGroup, FaceInfo, Person, PhotoRecord};
 pub use tintype_codecs::{self as codecs, Rgba, ThumbCache, decode_preview};
 pub use tintype_index::{FACET_FIELDS, FacetCount, Hit, SearchResults, Sort, split_smart};
-pub use tintype_jobs::{AnalyzeReport, FacesReport, ScanProgress, ScanReport, face_crop_path};
+pub use tintype_jobs::{AnalyzeReport, FacesReport, ScanProgress, ScanReport, SidecarReport, face_crop_path};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -154,6 +154,12 @@ pub enum Command {
     DeletePerson {
         person: i64,
     },
+    /// Read or change library settings; `None` leaves a setting as it is.
+    Settings {
+        /// Keep ratings, tags and people in `photo.jpg.xmp` sidecars next to the photos.
+        #[serde(default)]
+        write_sidecars: Option<bool>,
+    },
 }
 
 fn yes() -> bool {
@@ -202,6 +208,12 @@ pub enum Response {
     Changed {
         photos: u64,
     },
+    Settings {
+        write_sidecars: bool,
+        /// What turning sidecar writing on just did, if it was turned on.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sidecars: Option<SidecarReport>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -249,6 +261,9 @@ const SMART_MIN_PROBABILITY: f32 = 0.0003;
 /// flood in ("castle": best 0.12, old buildings at 0.044). Tuned on a
 /// 4,253-photo library by checking results at increasing depth.
 const SMART_WINDOW: f32 = 0.045;
+
+/// Library setting: write XMP sidecars ("1", the default) or only read them ("0").
+const WRITE_SIDECARS: &str = "sidecars.write";
 
 /// Models smart search needs, downloaded together.
 const SMART_MODELS: [ModelSpec; 3] = [SIGLIP_VISION, SIGLIP_TEXT, SIGLIP_TOKENIZER];
@@ -346,12 +361,16 @@ impl Engine {
             Command::Show { photo } => Ok(Response::Photo(Box::new(self.resolve(&photo)?))),
             Command::Rate { photo, rating } => {
                 let id = self.resolve(&photo)?.id;
+                self.before_edit(&[id])?;
                 self.catalog.set_rating(id, rating)?;
+                self.after_edit(&[id])?;
                 self.refresh(id)
             }
             Command::Tag { photo, add, remove } => {
                 let id = self.resolve(&photo)?.id;
+                self.before_edit(&[id])?;
                 self.catalog.edit_tags(id, &add, &remove)?;
+                self.after_edit(&[id])?;
                 self.refresh(id)
             }
             Command::Analyze { batch } => self.analyze(batch, events).map(Response::Analyze),
@@ -384,12 +403,16 @@ impl Engine {
             Command::PersonFaces { person } => Ok(Response::FaceList { faces: self.catalog.person_faces(person)? }),
             Command::NameFaces { faces, name } => {
                 let photos = self.catalog.photos_of_faces(&faces)?;
+                self.before_edit(&photos)?;
                 self.catalog.name_faces(&faces, &name)?;
+                self.after_edit(&photos)?;
                 self.after_people_edit(photos)
             }
             Command::RejectFace { face } => {
                 let photos = self.catalog.photos_of_faces(&[face])?;
+                self.before_edit(&photos)?;
                 self.catalog.reject_face(face)?;
+                self.after_edit(&photos)?;
                 self.after_people_edit(photos)
             }
             Command::UngroupFace { face } => {
@@ -398,13 +421,33 @@ impl Engine {
             }
             Command::RenamePerson { person, name } => {
                 let photos = self.catalog.photos_of_person(person)?;
+                self.before_edit(&photos)?;
                 self.catalog.rename_person(person, &name)?;
+                self.after_edit(&photos)?;
                 self.after_people_edit(photos)
             }
             Command::DeletePerson { person } => {
                 let photos = self.catalog.photos_of_person(person)?;
+                self.before_edit(&photos)?;
                 self.catalog.delete_person(person)?;
+                self.after_edit(&photos)?;
                 self.after_people_edit(photos)
+            }
+            Command::Settings { write_sidecars } => {
+                let mut sidecars = None;
+                if let Some(on) = write_sidecars {
+                    let was_on = self.write_sidecars_on()?;
+                    self.catalog.set_setting(WRITE_SIDECARS, if on { "1" } else { "0" })?;
+                    if on && !was_on {
+                        // Catch up: write sidecars for everything edited while it was off.
+                        let roots: Vec<PathBuf> = self.catalog.roots()?.into_iter().map(PathBuf::from).collect();
+                        let mode = tintype_jobs::SyncMode::CatchUp;
+                        let mut report = tintype_jobs::sync_sidecars(&mut self.catalog, &roots, mode)?;
+                        self.reindex_photos(std::mem::take(&mut report.changed_photos))?;
+                        sidecars = Some(report);
+                    }
+                }
+                Ok(Response::Settings { write_sidecars: self.write_sidecars_on()?, sidecars })
             }
         }
     }
@@ -421,6 +464,26 @@ impl Engine {
         let analyzer = Arc::new(FaceAnalyzer::load(&paths[0], &paths[1])?);
         self.analyzer = Some(analyzer.clone());
         Ok(analyzer)
+    }
+
+    fn write_sidecars_on(&self) -> Result<bool> {
+        Ok(self.catalog.setting(WRITE_SIDECARS)?.is_none_or(|v| v != "0"))
+    }
+
+    /// Before an edit: picks up sidecars changed by other apps, so the edit
+    /// builds on them instead of overwriting them.
+    fn before_edit(&mut self, photos: &[i64]) -> Result<()> {
+        let report = tintype_jobs::import_changed(&mut self.catalog, photos)?;
+        self.reindex_photos(report.changed_photos)?;
+        Ok(())
+    }
+
+    /// After an edit: writes the photos' sidecars, if sidecars are on.
+    fn after_edit(&mut self, photos: &[i64]) -> Result<()> {
+        if self.write_sidecars_on()? {
+            tintype_jobs::write_sidecars(&mut self.catalog, photos)?;
+        }
+        Ok(())
     }
 
     /// Downloads every smart search model, so analysis and search both work offline afterwards.
@@ -520,9 +583,17 @@ impl Engine {
 
     fn scan(&mut self, roots: &[PathBuf], hash: bool, events: &mut dyn FnMut(Event)) -> Result<ScanReport> {
         let opts = ScanOptions { hash, ..ScanOptions::default() };
-        let report =
+        let mut report =
             tintype_jobs::scan(&mut self.catalog, roots, &opts, &self.cancel, &mut |p| events(Event::Scan(p)))?;
         self.catalog.add_roots(&report.roots)?;
+        if !report.cancelled {
+            let scanned: Vec<PathBuf> = report.roots.iter().map(PathBuf::from).collect();
+            let mode = if self.write_sidecars_on()? { SyncMode::Write } else { SyncMode::ReadOnly };
+            report.sidecars = tintype_jobs::sync_sidecars(&mut self.catalog, &scanned, mode)?;
+            report.changed_ids.append(&mut report.sidecars.changed_photos);
+            report.changed_ids.sort_unstable();
+            report.changed_ids.dedup();
+        }
         self.embeddings = None;
         for &face in &report.removed_face_ids {
             let _ = std::fs::remove_file(face_crop_path(&self.faces_dir(), face));
@@ -692,6 +763,42 @@ mod tests {
         assert_eq!(r.total, 1);
         let Response::Stats(stats) = engine.execute(Command::Stats, &mut |_| {}).unwrap() else { panic!() };
         assert_eq!(stats.unanalyzed, 1);
+    }
+
+    #[test]
+    fn sidecars_are_imported_and_written() {
+        let photos = tempfile::tempdir().unwrap();
+        let (a, b) = (photos.path().join("a.jpg"), photos.path().join("b.jpg"));
+        JpegSpec::canon().write(&a);
+        JpegSpec::nikon().write(&b);
+        let sidecar =
+            tintype_meta::xmp::Sidecar { rating: Some(4), tags: vec!["Barn".into()], people: vec!["Grace".into()] };
+        tintype_meta::xmp::write_sidecar(&a, &sidecar).unwrap();
+        let lib = tempfile::tempdir().unwrap();
+        let mut engine = Engine::open(lib.path()).unwrap();
+        let Response::Scan(r) =
+            engine.execute(Command::Scan { roots: vec![photos.path().into()], hash: true }, &mut |_| {}).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(r.sidecars.imported, 1);
+        assert_eq!(hits(&mut engine, "tag:barn rating:4 person:grace"), vec!["a.jpg"]);
+
+        // A rating in Tintype lands in b's (new) sidecar.
+        engine.execute(Command::Rate { photo: PhotoRef::Path(b.clone()), rating: Some(5) }, &mut |_| {}).unwrap();
+        assert_eq!(tintype_meta::xmp::read_sidecar(&b).unwrap().unwrap().rating, Some(5));
+
+        // With writing off, edits stay in the catalog.
+        let off = Command::Settings { write_sidecars: Some(false) };
+        let Response::Settings { write_sidecars, .. } = engine.execute(off, &mut |_| {}).unwrap() else { panic!() };
+        assert!(!write_sidecars);
+        engine.execute(Command::Rate { photo: PhotoRef::Path(b.clone()), rating: Some(1) }, &mut |_| {}).unwrap();
+        assert_eq!(tintype_meta::xmp::read_sidecar(&b).unwrap().unwrap().rating, Some(5));
+
+        // Turning it back on catches up.
+        let on = Command::Settings { write_sidecars: Some(true) };
+        engine.execute(on, &mut |_| {}).unwrap();
+        assert_eq!(tintype_meta::xmp::read_sidecar(&b).unwrap().unwrap().rating, Some(1));
     }
 
     #[test]

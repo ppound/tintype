@@ -18,6 +18,7 @@ tintype-catalog.workspace = true
 tintype-codecs.workspace = true
 tintype-faces.workspace = true
 tintype-meta.workspace = true
+tracing.workspace = true
 walkdir.workspace = true
 
 [dev-dependencies]

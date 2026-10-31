@@ -10,6 +10,7 @@ publish.workspace = true
 chrono.workspace = true
 imagesize.workspace = true
 kamadak-exif.workspace = true
+quick-xml.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tintype-codecs.workspace = true

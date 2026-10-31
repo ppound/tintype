@@ -50,6 +50,8 @@ pub enum Error {
     UnknownFacet(String),
     #[error("invalid facet path {0:?}")]
     BadFacetPath(String),
+    #[error("{0} exists but is not a Tintype search index; refusing to replace it")]
+    NotAnIndex(std::path::PathBuf),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -173,6 +175,11 @@ impl PhotoIndex {
             (Index::open_in_dir(dir)?, false)
         } else {
             if dir.exists() {
+                // Only ever delete our own index: the marker shows we created it.
+                let ours = version_path.exists() || std::fs::read_dir(dir)?.next().is_none();
+                if !ours {
+                    return Err(Error::NotAnIndex(dir.to_path_buf()));
+                }
                 std::fs::remove_dir_all(dir)?;
             }
             std::fs::create_dir_all(dir)?;
@@ -591,5 +598,15 @@ mod tests {
         let (idx, fresh) = PhotoIndex::open(&path).unwrap();
         assert!(fresh);
         assert_eq!(idx.doc_count(), 0);
+    }
+
+    #[test]
+    fn never_replaces_a_folder_it_did_not_create() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("holiday.jpg"), b"precious").unwrap();
+        assert!(matches!(PhotoIndex::open(&path), Err(Error::NotAnIndex(_))));
+        assert_eq!(std::fs::read(path.join("holiday.jpg")).unwrap(), b"precious");
     }
 }

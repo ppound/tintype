@@ -16,7 +16,7 @@ use tintype_engine::{
     Command, Engine, Event, FacetCount, Hit, PhotoRecord, PhotoRef, Response, ScanProgress, Sort, Stats, split_smart,
 };
 
-use crate::backend::{Backend, Job, Msg};
+use crate::backend::{Backend, Job, Msg, Reply};
 use crate::thumbs::{Slot, Thumbs};
 
 mod people;
@@ -139,6 +139,8 @@ pub struct TintypeApp {
 
     scan: Option<ScanState>,
     stats: Option<Stats>,
+    /// Library setting, once the engine has said.
+    write_sidecars: Option<bool>,
     notice: Option<Notice>,
     screenshot: Option<Screenshot>,
 }
@@ -184,6 +186,7 @@ impl TintypeApp {
             scroll_to_selected: false,
             scan: None,
             stats: None,
+            write_sidecars: None,
             notice: None,
             screenshot: screenshot.map(|plan| Screenshot {
                 plan,
@@ -198,6 +201,7 @@ impl TintypeApp {
             app.query = q;
         }
         app.refresh_stats();
+        app.backend.send(Job::Settings, Command::Settings { write_sidecars: None });
         app.search();
         app
     }
@@ -307,7 +311,10 @@ impl TintypeApp {
         for msg in msgs {
             match msg {
                 Msg::Progress(event) => self.on_progress(event),
-                Msg::Reply(r) => self.on_reply(r.job, r.seq, r.result),
+                Msg::Reply(r) => {
+                    let Reply { job, seq, result } = *r;
+                    self.on_reply(job, seq, result)
+                }
             }
         }
     }
@@ -383,13 +390,24 @@ impl TintypeApp {
                     Ok(Response::Scan(r)) if r.cancelled => self.notify("Scan cancelled. Rescan to finish.", false),
                     Ok(Response::Scan(r)) => {
                         let mut parts = vec![format!("{} photos", thousands(r.found))];
-                        for (n, what) in [(r.added, "new"), (r.updated, "updated"), (r.removed, "removed")] {
+                        let counts =
+                            [(r.added, "new"), (r.updated, "updated"), (r.moved, "moved"), (r.removed, "removed")];
+                        for (n, what) in counts {
                             if n > 0 {
                                 parts.push(format!("{} {what}", thousands(n)));
                             }
                         }
                         if r.unreadable > 0 {
                             parts.push(format!("{} without readable metadata", thousands(r.unreadable)));
+                        }
+                        if r.sidecars.imported > 0 {
+                            parts.push(format!("{} .xmp sidecars read", thousands(r.sidecars.imported)));
+                        }
+                        if r.sidecars.failed > 0 {
+                            parts.push(format!(
+                                "{} sidecars could not be read or written",
+                                thousands(r.sidecars.failed)
+                            ));
                         }
                         self.notify(format!("Scan finished: {}", parts.join(", ")), false);
                         if r.updated > 0 || r.removed > 0 {
@@ -404,6 +422,13 @@ impl TintypeApp {
             }
 
             (Job::Stats, Ok(Response::Stats(s))) => self.stats = Some(s),
+            (Job::Settings, Ok(Response::Settings { write_sidecars, sidecars })) => {
+                self.write_sidecars = Some(write_sidecars);
+                if let Some(s) = sidecars.filter(|s| s.written + s.failed > 0) {
+                    let failed = if s.failed > 0 { format!(", {} failed", thousands(s.failed)) } else { String::new() };
+                    self.notify(format!("Wrote {} sidecars{failed}", thousands(s.written)), s.failed > 0);
+                }
+            }
 
             (_, Err(e)) => self.notify(e, true),
             (_, Ok(_)) => {}
@@ -575,6 +600,21 @@ impl TintypeApp {
         if ui.add_enabled(idle, Button::new("Add folder…")).clicked() {
             self.add_folder();
         }
+        ui.menu_button("Settings", |ui| {
+            let Some(mut on) = self.write_sidecars else {
+                ui.spinner();
+                return;
+            };
+            let resp = ui.checkbox(&mut on, "Save ratings, tags and people in .xmp sidecars").on_hover_text(
+                "Writes photo.jpg.xmp next to each photo you rate, tag or name someone in, so the \
+                     information travels with your photos and other apps can read it. Your photos \
+                     themselves are never changed. Sidecars edited by other apps are always read.",
+            );
+            if resp.changed() {
+                self.write_sidecars = Some(on);
+                self.backend.send(Job::Settings, Command::Settings { write_sidecars: Some(on) });
+            }
+        });
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
@@ -937,10 +977,11 @@ impl TintypeApp {
         let Some(s) = &mut self.screenshot else { return };
         s.frames += 1;
         ctx.request_repaint();
-        if !s.selected && !self.results.is_empty() {
+        // Ready once a search has answered, even with no results.
+        if !s.selected && self.searched_once {
             s.selected = true;
             let view = s.plan.view.clone();
-            if let Some(i) = s.plan.select {
+            if let Some(i) = s.plan.select.filter(|_| !self.results.is_empty()) {
                 self.select(i.min(self.results.len() - 1));
             }
             match view.as_deref() {
@@ -1035,7 +1076,10 @@ impl eframe::App for TintypeApp {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        eframe::set_value(storage, eframe::APP_KEY, &self.settings);
+        // Screenshot runs change settings for the shot; don't keep them.
+        if self.screenshot.is_none() {
+            eframe::set_value(storage, eframe::APP_KEY, &self.settings);
+        }
     }
 }
 

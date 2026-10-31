@@ -1,7 +1,12 @@
 //! Incremental folder scan: find photos, read metadata for new or changed
 //! files, and drop catalog entries for files that no longer exist.
+//!
+//! A new file with the same content as a file that is gone (same hash, or
+//! same name, size and modification time when hashing is off) is the same
+//! photo moved or renamed: its catalog entry follows it, keeping ratings,
+//! tags, faces and analysis.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -52,12 +57,16 @@ pub struct ScanReport {
     pub added: u64,
     pub updated: u64,
     pub removed: u64,
+    /// Photos found at a new path (moved or renamed); not counted as added or removed.
+    pub moved: u64,
     /// Photos cataloged without metadata because it could not be read.
     pub unreadable: u64,
     /// Folders or files the walk could not access, and non-UTF-8 paths.
     pub skipped: u64,
     pub cancelled: bool,
     pub elapsed_ms: u64,
+    /// Filled in by the caller after the scan.
+    pub sidecars: crate::SidecarReport,
     /// Catalog ids that were added or updated; the caller reindexes these.
     #[serde(skip)]
     pub changed_ids: Vec<i64>,
@@ -74,6 +83,20 @@ struct Candidate {
     mtime_ns: i64,
     /// Known file, only cataloged by an older extractor: the catalog keeps its hash.
     content_unchanged: bool,
+    /// Not in the catalog: a new file, or one that moved here.
+    new: bool,
+}
+
+/// How a moved file is recognized.
+#[derive(Hash, PartialEq, Eq)]
+enum MoveKey {
+    Hash([u8; 32]),
+    NameSizeTime(String, u64, i64),
+}
+
+fn name_key(path: &str, size: u64, mtime_ns: i64) -> MoveKey {
+    let name = Path::new(path).file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+    MoveKey::NameSizeTime(name, size, mtime_ns)
 }
 
 /// Scans `roots` into `catalog`.
@@ -122,7 +145,7 @@ pub fn scan(
             let mtime_ns =
                 md.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos() as i64);
             let mut candidate =
-                Candidate { path: path.to_string(), size: md.len(), mtime_ns, content_unchanged: false };
+                Candidate { path: path.to_string(), size: md.len(), mtime_ns, content_unchanged: false, new: false };
 
             report.found += 1;
             if report.found.is_multiple_of(1000) {
@@ -143,6 +166,7 @@ pub fn scan(
                 }
                 None => {
                     report.added += 1;
+                    candidate.new = true;
                     changed.push(candidate);
                 }
             }
@@ -150,6 +174,23 @@ pub fn scan(
         }
     }
     progress(ScanProgress::Walking { found: report.found });
+
+    // Only drop entries whose file is really gone: an unreadable folder is not a deletion.
+    // A cancelled walk hasn't seen everything, so it can't tell what is gone.
+    let mut gone: HashSet<i64> = HashSet::new();
+    let mut gone_by_key: HashMap<MoveKey, Vec<i64>> = HashMap::new();
+    if !report.cancelled {
+        for (path, fp) in &known {
+            if !seen.contains(path) && roots.iter().any(|r| Path::new(path).starts_with(r)) && !Path::new(path).exists()
+            {
+                gone.insert(fp.id);
+                if let Some(h) = fp.hash {
+                    gone_by_key.entry(MoveKey::Hash(h)).or_default().push(fp.id);
+                }
+                gone_by_key.entry(name_key(path, fp.size, fp.mtime_ns)).or_default().push(fp.id);
+            }
+        }
+    }
 
     let total = changed.len() as u64;
     let mut done = 0;
@@ -159,22 +200,36 @@ pub fn scan(
             break;
         }
         let photos: Vec<NewPhoto> = chunk.par_iter().map(|c| analyze(c, opts)).collect();
+        for (c, p) in chunk.iter().zip(&photos).filter(|(c, _)| c.new) {
+            let by_hash = p.hash.as_deref().and_then(|h| blake3::Hash::from_hex(h).ok());
+            let keys = by_hash.map(|h| MoveKey::Hash(*h.as_bytes())).into_iter();
+            let mut from = None;
+            for key in keys.chain([name_key(&c.path, c.size, c.mtime_ns)]) {
+                let ids = gone_by_key.get_mut(&key).map(std::mem::take).unwrap_or_default();
+                let mut rest = ids.into_iter().filter(|id| gone.contains(id));
+                from = rest.next();
+                gone_by_key.insert(key, rest.collect());
+                if from.is_some() {
+                    break;
+                }
+            }
+            if let Some(id) = from {
+                gone.remove(&id);
+                catalog.relocate(id, &c.path)?;
+                report.moved += 1;
+                report.added -= 1;
+            }
+        }
         report.unreadable += photos.iter().filter(|p| p.error.is_some()).count() as u64;
         report.changed_ids.extend(catalog.upsert_many(&photos)?);
         done += chunk.len() as u64;
         progress(ScanProgress::Analyzing { done, total });
     }
 
-    // A cancelled walk hasn't seen everything, so it can't tell what is gone.
+    // A scan cancelled while reading may not have reached a moved file yet; keep its old entry.
     if !report.cancelled {
-        // Only drop entries whose file is really gone: an unreadable folder is not a deletion.
-        report.removed_ids = known
-            .iter()
-            .filter(|(path, _)| !seen.contains(*path))
-            .filter(|(path, _)| roots.iter().any(|r| Path::new(path).starts_with(r)))
-            .filter(|(path, _)| !Path::new(path).exists())
-            .map(|(_, fp)| fp.id)
-            .collect();
+        report.removed_ids = gone.into_iter().collect();
+        report.removed_ids.sort_unstable();
         report.removed_face_ids = catalog.remove_many(&report.removed_ids)?;
         report.removed = report.removed_ids.len() as u64;
     }
@@ -281,6 +336,48 @@ mod tests {
             &mut |_| {},
         );
         assert!(matches!(err, Err(Error::Root { .. })));
+    }
+
+    fn path_of(root: &Path, rel: &str) -> String {
+        dunce::canonicalize(root.join(rel)).unwrap().display().to_string()
+    }
+
+    #[test]
+    fn moved_photos_keep_their_entry() {
+        for hash in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            JpegSpec::canon().write(&root.join("in/a.jpg"));
+            JpegSpec::nikon().write(&root.join("in/b.jpg"));
+            let mut cat = Catalog::open_in_memory().unwrap();
+            let opts = ScanOptions { hash, ..ScanOptions::default() };
+            let run = |cat: &mut Catalog| {
+                scan(cat, &[root.to_path_buf()], &opts, &AtomicBool::new(false), &mut |_| {}).unwrap()
+            };
+            run(&mut cat);
+            let id = cat.get_by_path(&path_of(root, "in/a.jpg")).unwrap().unwrap().id;
+            cat.set_rating(id, Some(5)).unwrap();
+
+            // Move a.jpg into another folder under a new name; copy b.jpg.
+            std::fs::create_dir_all(root.join("out")).unwrap();
+            std::fs::rename(root.join("in/a.jpg"), root.join("out/a-renamed.jpg")).unwrap();
+            std::fs::copy(root.join("in/b.jpg"), root.join("out/b-copy.jpg")).unwrap();
+            let r = run(&mut cat);
+            if hash {
+                assert_eq!((r.moved, r.added, r.removed), (1, 1, 0), "a moved; the copy is a new photo");
+                let rec = cat.get_by_path(&path_of(root, "out/a-renamed.jpg")).unwrap().unwrap();
+                assert_eq!((rec.id, rec.rating), (id, Some(5)));
+            } else {
+                // Without hashes a renamed file can't be recognized: only same-name moves are.
+                assert_eq!((r.moved, r.removed), (0, 1));
+            }
+
+            // A same-name move into another folder is recognized either way.
+            std::fs::rename(root.join("in/b.jpg"), root.join("b.jpg")).unwrap();
+            let r = run(&mut cat);
+            assert_eq!((r.moved, r.added, r.removed), (1, 0, 0), "hash: {hash}");
+            assert_eq!(cat.count().unwrap(), 3);
+        }
     }
 
     #[test]

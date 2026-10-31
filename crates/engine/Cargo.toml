@@ -21,6 +21,7 @@ tintype-jobs.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+tintype-meta.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 tintype-testkit.workspace = true

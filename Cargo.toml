@@ -36,6 +36,7 @@ imagesize = "0.15"
 jpeg-decoder = { version = "0.3", default-features = false }
 mimalloc = "0.1"
 kamadak-exif = "0.6"
+quick-xml = "0.41"
 rayon = "1.12"
 rfd = "0.17"
 rusqlite = { version = "0.41", features = ["bundled"] }

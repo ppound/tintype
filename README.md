@@ -12,8 +12,8 @@ Status: indexing, search, the desktop app, face recognition and smart
 cargo run --release -p tintype
 ```
 
-Click **Add folder…** to add your photos. Tintype reads them where they are;
-nothing is moved or changed. You get:
+Click **Add folder…** to add your photos. Tintype reads them where they are and
+never changes, moves or deletes a photo. You get:
 
 - a search bar (same syntax as below), with facet filters for camera, lens,
   date, tags, file type and folder in the sidebar
@@ -31,7 +31,27 @@ nothing is moved or changed. You get:
   first. Field terms like `year:2024` or `rating:>=4` still filter. Tintype
   looks at each photo once first (**Analyze photos**, about 0.15 s per photo).
 
-Face recognition and smart search run entirely on your computer; nothing is uploaded. The first
+Face recognition and smart search run entirely on your computer; nothing is uploaded.
+
+### Sidecars: your metadata travels with your photos
+
+Ratings, tags and people are also saved in an XMP sidecar next to each photo
+(`DSCF1234.JPG.xmp`, the same format PhotoStat writes), so they survive moving
+photos around, a lost catalog, or another app. Tintype only touches the
+properties it owns (`xmp:Rating`, `dc:subject`, `Iptc4xmpExt:PersonInImage`)
+and keeps everything else in an existing sidecar as it was.
+
+- Scans read sidecars that changed outside Tintype; the sidecar wins. Existing
+  PhotoStat sidecars are imported this way, people included (as names in the
+  photo: sidecars don't say which face is whom).
+- Edits in Tintype are written back right away. Sidecars are only created for
+  photos that have a rating, tags or people.
+- **Settings › Save ratings, tags and people in .xmp sidecars** (or
+  `tintype-cli settings --sidecars off`) stops writing; sidecars are still read.
+  Turning it back on writes everything edited in the meantime.
+
+Moving or renaming photos inside your folders keeps everything Tintype knows
+about them: a rescan recognizes a file by its content. The first
 run downloads two small open models (YuNet, MIT; SFace, Apache-2.0; 39 MB in
 total), verified by SHA-256. Smart search downloads Google's SigLIP B/16
 (Apache-2.0, 815 MB) the first time.
@@ -52,6 +72,7 @@ tintype-cli faces                           # find faces in photos not yet check
 tintype-cli people                          # named people and unnamed groups
 tintype-cli name "Ada" 113 681 871          # name faces (ids from `people`)
 tintype-cli analyze                         # embed photos for smart search
+tintype-cli settings --sidecars off         # stop writing .xmp sidecars
 tintype-cli search --smart dog on a beach year:2024
 ```
 
@@ -100,10 +121,10 @@ layer 7  apps/tintype (desktop)  apps/tintype-cli
 
 | Crate      | Role |
 |------------|------|
-| `meta`     | EXIF extraction in pure Rust (JPEG, TIFF-based RAW, Fujifilm RAF, HEIF, PNG, WebP) |
+| `meta`     | EXIF extraction in pure Rust (JPEG, TIFF-based RAW, Fujifilm RAF, HEIF, PNG, WebP); XMP sidecar reading and minimal-change writing |
 | `catalog`  | SQLite: the source of truth for photos, extracted metadata, ratings and tags |
 | `index`    | tantivy full-text, numeric and facet search. Derived from the catalog and rebuilt automatically when missing, outdated or out of sync |
-| `jobs`     | Incremental parallel scanning; batched face and analysis passes; people matching. All report progress and can be cancelled |
+| `jobs`     | Incremental parallel scanning with move detection; sidecar sync; batched face and analysis passes; people matching. All report progress and can be cancelled |
 | `engine`   | Command registry. CLI, GUI and automation all run the same serde `Command`s |
 | `codecs`   | Thumbnails and previews: DCT-scaled JPEG decoding, RAF embedded JPEGs, a disk thumbnail cache. HEIC and other RAW formats are *planned* |
 | `infer`    | Model registry, verified downloads, and ONNX inference on `tract` (pure Rust, no native libraries). An ONNX Runtime backend for large models and GPUs is *planned* |
@@ -112,12 +133,15 @@ layer 7  apps/tintype (desktop)  apps/tintype-cli
 | `ui-egui`  | The desktop UI. The engine runs on its own thread and thumbnails decode on a worker pool, newest request first |
 
 Design rules:
+- **Photos are read-only.** Tintype writes only to its library folder and, when
+  enabled, to `.xmp` sidecars beside photos. It never deletes a folder it didn't create.
 - **The catalog is the truth; the index is a cache.** Deleting `index/` loses nothing.
 - **Incremental by default.** A file is re-read only when its size or mtime
   changes, or when `meta::EXTRACTOR_VERSION` is bumped. A metadata-only refresh
   keeps the existing content hash.
 - **Never treat unreadable as deleted.** A scan only removes entries whose file
-  is actually gone, and a cancelled scan removes nothing.
+  is actually gone, and a cancelled scan removes nothing. A gone file whose content
+  (hash, or name + size + mtime without hashing) shows up elsewhere was moved, not deleted.
 - **No bundled model weights.** Models download on first use and are verified by SHA-256.
 - **Faces are compared with faces, never with an average face.** Face embeddings
   share a common direction, so the mean of a large mixed set looks like everyone.
@@ -152,4 +176,5 @@ a screenshot and exits. `TINTYPE_SCREENSHOT_SELECT=<n>` selects a result first,
 4. ~~Smart search (SigLIP embeddings)~~
    Next: near-duplicates (perceptual hash), zero-shot auto-tags, aesthetic score
 5. Packaging: MSI, DMG, AppImage from CI
-6. Import PhotoStat sidecars (JSON/XMP) so existing names and tags carry over
+6. ~~Read and write PhotoStat XMP sidecars~~
+   Next: import PhotoStat's JSON data, if any; use `photostat:place`

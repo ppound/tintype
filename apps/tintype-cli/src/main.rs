@@ -108,8 +108,21 @@ enum Cmd {
     },
     /// List the faces found in a photo.
     ShowFaces { photo: String },
+    /// Show or change library settings.
+    Settings {
+        /// Keep ratings, tags and people in `photo.jpg.xmp` sidecars next to the photos
+        /// (on by default). Sidecars changed by other apps are always read.
+        #[arg(long, value_enum)]
+        sidecars: Option<OnOff>,
+    },
     /// Read JSON commands from stdin, one per line; write one JSON response per line.
     Exec,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum OnOff {
+    On,
+    Off,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -157,6 +170,7 @@ fn main() -> Result<()> {
         Cmd::People => Command::People,
         Cmd::Name { name, faces } => Command::NameFaces { faces, name },
         Cmd::ShowFaces { photo } => Command::PhotoFaces { photo: photo_ref(&photo) },
+        Cmd::Settings { sidecars } => Command::Settings { write_sidecars: sidecars.map(|s| matches!(s, OnOff::On)) },
     };
 
     let response = engine.execute(cmd, &mut progress)?;
@@ -288,14 +302,19 @@ fn print_response(response: &Response) {
     match response {
         Response::Scan(r) => {
             println!(
-                "{} photos found in {:.1}s: {} new, {} changed, {} unchanged, {} removed",
+                "{} photos found in {:.1}s: {} new, {} changed, {} unchanged, {} moved, {} removed",
                 r.found,
                 r.elapsed_ms as f64 / 1000.0,
                 r.added,
                 r.updated,
                 r.unchanged,
+                r.moved,
                 r.removed
             );
+            let s = &r.sidecars;
+            if s.imported + s.written + s.failed > 0 {
+                println!("sidecars: {} read, {} written, {} failed", s.imported, s.written, s.failed);
+            }
             if r.unreadable > 0 {
                 println!("{} photos had unreadable metadata (cataloged by path only)", r.unreadable);
             }
@@ -367,6 +386,13 @@ fn print_response(response: &Response) {
             }
         }
         Response::Changed { photos } => println!("updated {photos} photos"),
+        Response::Settings { write_sidecars, sidecars } => {
+            let state = if *write_sidecars { "on" } else { "off (read only)" };
+            println!("sidecars  {state}");
+            if let Some(s) = sidecars {
+                println!("caught up: {} sidecars written, {} read, {} failed", s.written, s.imported, s.failed);
+            }
+        }
         Response::Stats(s) => {
             println!("library  {}", s.library);
             println!("photos   {}", s.photos);

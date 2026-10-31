@@ -24,6 +24,7 @@ pub enum Job {
     FindFaces,
     PeopleEdit,
     Analyze,
+    Settings,
 }
 
 pub struct Reply {
@@ -34,7 +35,7 @@ pub struct Reply {
 }
 
 pub enum Msg {
-    Reply(Reply),
+    Reply(Box<Reply>),
     Progress(Event),
 }
 
@@ -63,7 +64,7 @@ impl Backend {
                         ctx.request_repaint();
                     });
                     let result = result.map_err(|e| e.to_string());
-                    if out.send(Msg::Reply(Reply { job, seq, result })).is_err() {
+                    if out.send(Msg::Reply(Box::new(Reply { job, seq, result }))).is_err() {
                         break;
                     }
                     ctx.request_repaint();
