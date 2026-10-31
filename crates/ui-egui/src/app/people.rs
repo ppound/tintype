@@ -121,11 +121,12 @@ impl TintypeApp {
         self.backend.send(Job::FindFaces, Command::FindFaces { batch: FACE_BATCH });
     }
 
-    /// Cancel button: stops a scan or the face loop.
+    /// Cancel button: stops a scan, the face loop or the analysis loop.
     pub(super) fn stop_jobs(&mut self) {
         if let Some(f) = &mut self.people.finding {
             f.stop = true;
         }
+        self.smart.stop();
         self.backend.cancel();
     }
 

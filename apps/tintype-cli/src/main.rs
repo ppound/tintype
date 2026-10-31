@@ -45,6 +45,10 @@ enum Cmd {
     Search {
         /// Query; omit to match everything.
         query: Vec<String>,
+        /// Match the words by what the photos show, e.g. `--smart dog on a beach year:2024`
+        /// (run `analyze` first). Field terms still filter; results are ranked by match.
+        #[arg(long)]
+        smart: bool,
         #[arg(long, value_enum, default_value_t = SortArg::Relevance)]
         sort: SortArg,
         #[arg(short = 'n', long, default_value_t = 20)]
@@ -88,6 +92,12 @@ enum Cmd {
         #[arg(long, default_value_t = 150)]
         batch: usize,
     },
+    /// Analyze photos for smart search (downloads the SigLIP models once, ~815 MB).
+    Analyze {
+        /// Photos per batch.
+        #[arg(long, default_value_t = 200)]
+        batch: usize,
+    },
     /// List named people and unnamed groups of similar faces.
     People,
     /// Name faces (ids from `people` or `show-faces`), creating the person if new.
@@ -125,13 +135,13 @@ fn main() -> Result<()> {
     let cmd = match cli.cmd {
         Cmd::Scan { folders, no_hash } => Command::Scan { roots: folders, hash: !no_hash },
         Cmd::Rescan { no_hash } => Command::Rescan { hash: !no_hash },
-        Cmd::Search { query, sort, limit, offset } => {
+        Cmd::Search { query, smart, sort, limit, offset } => {
             let sort = match sort {
                 SortArg::Relevance => Sort::Relevance,
                 SortArg::Newest => Sort::Newest,
                 SortArg::Oldest => Sort::Oldest,
             };
-            Command::Search { query: query.join(" "), sort, limit, offset }
+            Command::Search { query: query.join(" "), smart, sort, limit, offset }
         }
         Cmd::Facets { field, query, parent } => Command::Facets { field, query, parent },
         Cmd::Show { photo } => Command::Show { photo: photo_ref(&photo) },
@@ -143,6 +153,7 @@ fn main() -> Result<()> {
         Cmd::Stats => Command::Stats,
         Cmd::Exec => return exec(&mut engine),
         Cmd::Faces { batch } => return find_faces(&mut engine, batch, cli.json),
+        Cmd::Analyze { batch } => return analyze(&mut engine, batch, cli.json),
         Cmd::People => Command::People,
         Cmd::Name { name, faces } => Command::NameFaces { faces, name },
         Cmd::ShowFaces { photo } => Command::PhotoFaces { photo: photo_ref(&photo) },
@@ -183,6 +194,7 @@ fn progress(event: Event) {
             format!("downloading {model}: {:.0}%", done as f64 * 100.0 / total.max(1) as f64)
         }
         Event::Faces { done, total } => format!("finding faces {done}/{total}"),
+        Event::Analyze { done, total } => format!("analyzing {done}/{total}"),
     };
     let _ = write!(err, "\r\x1b[2K{line}");
     let _ = err.flush();
@@ -212,6 +224,37 @@ fn find_faces(engine: &mut Engine, batch: usize, json: bool) -> Result<()> {
         println!("{}", serde_json::json!({ "photos": photos, "faces": faces, "failed": failed, "seconds": secs }));
     } else {
         println!("{photos} photos analyzed in {secs:.1}s: {faces} faces found");
+        if failed > 0 {
+            println!("{failed} photos could not be decoded (no preview support for their format yet)");
+        }
+    }
+    Ok(())
+}
+
+/// Runs analysis batches until every photo has an embedding.
+fn analyze(engine: &mut Engine, batch: usize, json: bool) -> Result<()> {
+    let started = std::time::Instant::now();
+    let (mut photos, mut failed) = (0, 0);
+    loop {
+        let Response::Analyze(r) = engine.execute(Command::Analyze { batch }, &mut progress)? else {
+            unreachable!("Analyze answers with Analyze")
+        };
+        (photos, failed) = (photos + r.processed, failed + r.failed);
+        if std::io::stderr().is_terminal() {
+            eprint!("\r\x1b[2K{photos} photos analyzed, {} to go", r.remaining);
+        }
+        if r.remaining == 0 || r.cancelled || r.processed == 0 {
+            break;
+        }
+    }
+    if std::io::stderr().is_terminal() {
+        eprint!("\r\x1b[2K");
+    }
+    let secs = started.elapsed().as_secs_f64();
+    if json {
+        println!("{}", serde_json::json!({ "photos": photos, "failed": failed, "seconds": secs }));
+    } else {
+        println!("{photos} photos analyzed in {secs:.1}s");
         if failed > 0 {
             println!("{failed} photos could not be decoded (no preview support for their format yet)");
         }
@@ -282,6 +325,7 @@ fn print_response(response: &Response) {
         Response::Photo(p) => print_photo(p),
         Response::Reindexed { photos } => println!("indexed {photos} photos"),
         Response::Faces(r) => println!("{} photos analyzed, {} faces, {} to go", r.processed, r.faces, r.remaining),
+        Response::Analyze(r) => println!("{} photos analyzed, {} to go", r.processed, r.remaining),
         Response::People { people, groups, unscanned, .. } => {
             if people.is_empty() {
                 println!("No named people yet.");
@@ -329,6 +373,9 @@ fn print_response(response: &Response) {
             println!("indexed  {}", s.indexed);
             for f in &s.folders {
                 println!("folder   {f}");
+            }
+            if s.unanalyzed > 0 {
+                println!("\n{} photos not yet analyzed for smart search; run `tintype-cli analyze`.", s.unanalyzed);
             }
         }
     }

@@ -23,6 +23,7 @@ pub enum Job {
     PersonFaces,
     FindFaces,
     PeopleEdit,
+    Analyze,
 }
 
 pub struct Reply {
@@ -84,7 +85,7 @@ impl Backend {
         self.rx.try_iter()
     }
 
-    /// Asks the running command (a scan) to stop early.
+    /// Asks the running command (a scan or a batch) to stop early.
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
     }

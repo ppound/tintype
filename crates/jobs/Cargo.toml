@@ -1,6 +1,6 @@
 [package]
 name = "tintype-jobs"
-description = "Long-running library work: scanning, (later) analysis and face passes"
+description = "Long-running library work: scanning, image analysis and face passes"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,6 +13,7 @@ image.workspace = true
 rayon.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+tintype-analyze.workspace = true
 tintype-catalog.workspace = true
 tintype-codecs.workspace = true
 tintype-faces.workspace = true

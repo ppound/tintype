@@ -8,16 +8,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
+use tintype_analyze::{ANALYSIS_VERSION, ImageEncoder, TextEncoder};
 use tintype_catalog::Catalog;
 use tintype_faces::{FACES_VERSION, FaceAnalyzer};
 use tintype_index::PhotoIndex;
-use tintype_infer::{ModelStore, SFACE, YUNET};
+use tintype_infer::{ModelSpec, ModelStore, SFACE, SIGLIP_TEXT, SIGLIP_TOKENIZER, SIGLIP_VISION, YUNET};
 use tintype_jobs::ScanOptions;
 
 pub use tintype_catalog::{FaceGroup, FaceInfo, Person, PhotoRecord};
 pub use tintype_codecs::{self as codecs, Rgba, ThumbCache, decode_preview};
-pub use tintype_index::{FACET_FIELDS, FacetCount, Hit, SearchResults, Sort};
-pub use tintype_jobs::{FacesReport, ScanProgress, ScanReport, face_crop_path};
+pub use tintype_index::{FACET_FIELDS, FacetCount, Hit, SearchResults, Sort, split_smart};
+pub use tintype_jobs::{AnalyzeReport, FacesReport, ScanProgress, ScanReport, face_crop_path};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -33,6 +34,8 @@ pub enum Error {
     Model(#[from] tintype_infer::Error),
     #[error(transparent)]
     Analyzer(#[from] tintype_faces::Error),
+    #[error(transparent)]
+    Analysis(#[from] tintype_analyze::Error),
     #[error("{path}: {source}")]
     Library { path: PathBuf, source: std::io::Error },
     #[error("no photo {0} in the library")]
@@ -69,6 +72,10 @@ pub enum Command {
     Search {
         #[serde(default)]
         query: String,
+        /// Match the words by what the photos show (field terms still filter).
+        /// Results are ranked by similarity; `sort` is ignored.
+        #[serde(default)]
+        smart: bool,
         #[serde(default)]
         sort: Sort,
         #[serde(default = "default_limit")]
@@ -98,6 +105,12 @@ pub enum Command {
         add: Vec<String>,
         #[serde(default)]
         remove: Vec<String>,
+    },
+    /// Embed up to `batch` photos for smart search (downloading the models
+    /// first if needed). Repeat until `remaining` is 0, like `FindFaces`.
+    Analyze {
+        #[serde(default = "default_analyze_batch")]
+        batch: usize,
     },
     /// Rebuild the search index from the catalog.
     Reindex,
@@ -155,6 +168,9 @@ fn facet_root() -> String {
 fn default_face_batch() -> usize {
     150
 }
+fn default_analyze_batch() -> usize {
+    200
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "response", rename_all = "snake_case")]
@@ -170,6 +186,7 @@ pub enum Response {
     },
     Stats(Stats),
     Faces(FacesReport),
+    Analyze(AnalyzeReport),
     People {
         people: Vec<Person>,
         groups: Vec<FaceGroup>,
@@ -193,6 +210,11 @@ pub struct Stats {
     pub photos: u64,
     pub indexed: u64,
     pub folders: Vec<String>,
+    /// Photos not yet analyzed for smart search.
+    pub unanalyzed: u64,
+    /// Smart search models are downloaded; if not, `smart_download_bytes` will be.
+    pub smart_ready: bool,
+    pub smart_download_bytes: u64,
 }
 
 /// Progress from long-running commands.
@@ -202,6 +224,7 @@ pub enum Event {
     Reindex { done: u64, total: u64 },
     Download { model: &'static str, done: u64, total: u64 },
     Faces { done: u64, total: u64 },
+    Analyze { done: u64, total: u64 },
 }
 
 /// Where the library lives when the user doesn't choose: the OS data dir.
@@ -218,6 +241,18 @@ fn models_dir(library: &Path) -> PathBuf {
 /// Face passes between full recognition runs while a long face scan is going.
 const RECOGNIZE_EVERY: u32 = 4;
 
+/// Smart search shows photos at least this likely (SigLIP's calibrated
+/// probability) to match the description...
+const SMART_MIN_PROBABILITY: f32 = 0.0003;
+/// ...and within this similarity of the best match. A fixed floor alone fits
+/// rare subjects ("dog": true matches down to 0.046) but lets common ones
+/// flood in ("castle": best 0.12, old buildings at 0.044). Tuned on a
+/// 4,253-photo library by checking results at increasing depth.
+const SMART_WINDOW: f32 = 0.045;
+
+/// Models smart search needs, downloaded together.
+const SMART_MODELS: [ModelSpec; 3] = [SIGLIP_VISION, SIGLIP_TEXT, SIGLIP_TOKENIZER];
+
 /// Long edge, in pixels, of cached grid thumbnails.
 pub const THUMB_EDGE: u32 = 400;
 
@@ -230,6 +265,10 @@ pub struct Engine {
     models: ModelStore,
     analyzer: Option<Arc<FaceAnalyzer>>,
     batches_since_recognize: u32,
+    image_encoder: Option<Arc<ImageEncoder>>,
+    text_encoder: Option<TextEncoder>,
+    /// All image embeddings, loaded on the first smart search after a change.
+    embeddings: Option<Vec<(i64, Vec<f32>)>>,
 }
 
 impl Engine {
@@ -250,6 +289,9 @@ impl Engine {
             models: ModelStore::new(models_dir(dir)),
             analyzer: None,
             batches_since_recognize: 0,
+            image_encoder: None,
+            text_encoder: None,
+            embeddings: None,
         };
         if fresh || engine.index.doc_count() != engine.catalog.count()? {
             tracing::info!(fresh, "rebuilding search index");
@@ -290,7 +332,12 @@ impl Engine {
                 }
                 self.scan(&roots, hash, events).map(Response::Scan)
             }
-            Command::Search { query, sort, limit, offset } => {
+            Command::Search { query, smart: true, limit, offset, .. }
+                if !tintype_index::split_smart(&query).1.is_empty() =>
+            {
+                self.smart_search(&query, limit, offset, events).map(Response::Search)
+            }
+            Command::Search { query, sort, limit, offset, .. } => {
                 Ok(Response::Search(self.index.search(&query, sort, limit, offset)?))
             }
             Command::Facets { field, query, parent } => {
@@ -307,12 +354,20 @@ impl Engine {
                 self.catalog.edit_tags(id, &add, &remove)?;
                 self.refresh(id)
             }
+            Command::Analyze { batch } => self.analyze(batch, events).map(Response::Analyze),
             Command::Reindex => Ok(Response::Reindexed { photos: self.reindex(events)? }),
             Command::Stats => Ok(Response::Stats(Stats {
                 library: self.dir.display().to_string(),
                 photos: self.catalog.count()?,
                 indexed: self.index.doc_count(),
                 folders: self.catalog.roots()?,
+                unanalyzed: self.catalog.count_needing_analysis(ANALYSIS_VERSION)?,
+                smart_ready: SMART_MODELS.iter().all(|m| self.models.is_installed(m)),
+                smart_download_bytes: SMART_MODELS
+                    .iter()
+                    .filter(|m| !self.models.is_installed(m))
+                    .map(|m| m.bytes)
+                    .sum(),
             })),
 
             Command::FindFaces { batch } => self.find_faces(batch, events).map(Response::Faces),
@@ -368,6 +423,65 @@ impl Engine {
         Ok(analyzer)
     }
 
+    /// Downloads every smart search model, so analysis and search both work offline afterwards.
+    fn ensure_smart_models(&self, events: &mut dyn FnMut(Event)) -> Result<()> {
+        for spec in SMART_MODELS {
+            let mut progress = |done, total| events(Event::Download { model: spec.name, done, total });
+            self.models.ensure(&spec, &mut progress)?;
+        }
+        Ok(())
+    }
+
+    fn image_encoder(&mut self, events: &mut dyn FnMut(Event)) -> Result<Arc<ImageEncoder>> {
+        if let Some(e) = &self.image_encoder {
+            return Ok(e.clone());
+        }
+        self.ensure_smart_models(events)?;
+        let encoder = Arc::new(ImageEncoder::load(&self.models.path(&SIGLIP_VISION))?);
+        self.image_encoder = Some(encoder.clone());
+        Ok(encoder)
+    }
+
+    fn text_encoder(&mut self, events: &mut dyn FnMut(Event)) -> Result<&TextEncoder> {
+        if self.text_encoder.is_none() {
+            self.ensure_smart_models(events)?;
+            let (text, tokenizer) = (self.models.path(&SIGLIP_TEXT), self.models.path(&SIGLIP_TOKENIZER));
+            self.text_encoder = Some(TextEncoder::load(&text, &tokenizer)?);
+        }
+        Ok(self.text_encoder.as_ref().expect("loaded above"))
+    }
+
+    fn analyze(&mut self, batch: usize, events: &mut dyn FnMut(Event)) -> Result<AnalyzeReport> {
+        let encoder = self.image_encoder(events)?;
+        let mut progress = |done, total| events(Event::Analyze { done, total });
+        let report = tintype_jobs::analyze(&mut self.catalog, &encoder, batch.max(1), &self.cancel, &mut progress)?;
+        if report.processed > 0 {
+            self.embeddings = None;
+        }
+        Ok(report)
+    }
+
+    /// Ranks photos that pass the query's field terms by how well they match its words.
+    fn smart_search(
+        &mut self,
+        query: &str,
+        limit: usize,
+        offset: usize,
+        events: &mut dyn FnMut(Event),
+    ) -> Result<SearchResults> {
+        let (filters, words) = tintype_index::split_smart(query);
+        let target = self.text_encoder(events)?.embed_query(&words)?;
+        let allowed = self.index.matching_ids(&filters)?;
+        if self.embeddings.is_none() {
+            self.embeddings = Some(self.catalog.embeddings()?);
+        }
+        let min = tintype_analyze::similarity_for_probability(SMART_MIN_PROBABILITY);
+        let scored = rank(self.embeddings.as_deref().unwrap_or_default(), &allowed, &target, min, SMART_WINDOW);
+        let page: Vec<i64> = scored.iter().skip(offset).take(limit).map(|(_, id)| *id).collect();
+        let hits = self.catalog.paths(&page)?.into_iter().map(|(id, path)| Hit { id, path }).collect();
+        Ok(SearchResults { total: scored.len(), hits })
+    }
+
     fn find_faces(&mut self, batch: usize, events: &mut dyn FnMut(Event)) -> Result<FacesReport> {
         let analyzer = self.analyzer(events)?;
         let crops = self.faces_dir();
@@ -409,6 +523,7 @@ impl Engine {
         let report =
             tintype_jobs::scan(&mut self.catalog, roots, &opts, &self.cancel, &mut |p| events(Event::Scan(p)))?;
         self.catalog.add_roots(&report.roots)?;
+        self.embeddings = None;
         for &face in &report.removed_face_ids {
             let _ = std::fs::remove_file(face_crop_path(&self.faces_dir(), face));
         }
@@ -480,13 +595,29 @@ impl Engine {
     }
 }
 
+/// Photos in `allowed` (sorted ids) whose embedding is at least `min` similar
+/// to `target` and within `window` of the best, best first, as (similarity, id).
+fn rank(embeddings: &[(i64, Vec<f32>)], allowed: &[i64], target: &[f32], min: f32, window: f32) -> Vec<(f32, i64)> {
+    let mut scored: Vec<(f32, i64)> = embeddings
+        .iter()
+        .filter(|(id, _)| allowed.binary_search(id).is_ok())
+        .map(|(id, v)| (tintype_analyze::similarity(v, target), *id))
+        .filter(|(s, _)| *s >= min)
+        .collect();
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    if let Some(&(best, _)) = scored.first() {
+        scored.retain(|(s, _)| *s >= best - window);
+    }
+    scored
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tintype_testkit::JpegSpec;
 
     fn hits(engine: &mut Engine, query: &str) -> Vec<String> {
-        let cmd = Command::Search { query: query.into(), sort: Sort::Newest, limit: 50, offset: 0 };
+        let cmd = Command::Search { query: query.into(), smart: false, sort: Sort::Newest, limit: 50, offset: 0 };
         let Response::Search(r) = engine.execute(cmd, &mut |_| {}).unwrap() else { panic!() };
         r.hits.into_iter().map(|h| Path::new(&h.path).file_name().unwrap().to_string_lossy().into_owned()).collect()
     }
@@ -533,6 +664,34 @@ mod tests {
         assert!(matches!(cmd, Command::Search { limit: 50, sort: Sort::Relevance, .. }));
         let cmd: Command = serde_json::from_str(r#"{"command":"rate","photo":12,"rating":null}"#).unwrap();
         assert!(matches!(cmd, Command::Rate { photo: PhotoRef::Id(12), rating: None }));
+    }
+
+    #[test]
+    fn rank_filters_thresholds_and_orders() {
+        let embs = vec![(1, vec![1.0, 0.0]), (2, vec![0.6, 0.8]), (3, vec![0.0, 1.0]), (4, vec![0.8, 0.6])];
+        let ranked = rank(&embs, &[1, 2, 3], &[0.8, 0.6], 0.7, 1.0);
+        assert_eq!(
+            ranked.iter().map(|(_, id)| *id).collect::<Vec<_>>(),
+            vec![2, 1],
+            "best first; 4 filtered out, 3 too far"
+        );
+        let ranked = rank(&embs, &[1, 2, 3], &[0.8, 0.6], 0.0, 0.2);
+        assert_eq!(ranked.len(), 2, "3 (0.6) is more than 0.2 behind the best (0.96)");
+    }
+
+    #[test]
+    fn smart_search_without_words_is_a_normal_search() {
+        let photos = tempfile::tempdir().unwrap();
+        JpegSpec::canon().write(&photos.path().join("canon.jpg"));
+        let lib = tempfile::tempdir().unwrap();
+        let mut engine = Engine::open(lib.path()).unwrap();
+        engine.execute(Command::Scan { roots: vec![photos.path().into()], hash: false }, &mut |_| {}).unwrap();
+        // No description words: no models are needed.
+        let cmd = Command::Search { query: "iso:>=1000".into(), smart: true, sort: Sort::Newest, limit: 5, offset: 0 };
+        let Response::Search(r) = engine.execute(cmd, &mut |_| {}).unwrap() else { panic!() };
+        assert_eq!(r.total, 1);
+        let Response::Stats(stats) = engine.execute(Command::Stats, &mut |_| {}).unwrap() else { panic!() };
+        assert_eq!(stats.unanalyzed, 1);
     }
 
     #[test]

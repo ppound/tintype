@@ -15,12 +15,16 @@
 //! | `rating:>=4 tag:family`     | the user's own metadata                    |
 //! | `person:alice` `faces:>=3`  | people (named faces) and face count         |
 //! | `gps:true`                  | has location                               |
+//!
+//! Smart (semantic) search is done by the engine: [`split_smart`] separates
+//! field terms, which still filter here via [`PhotoIndex::matching_ids`], from
+//! the description, which is matched against image embeddings.
 
 use std::path::{Component, Path};
 
 use chrono::Datelike;
 use serde::Serialize;
-use tantivy::collector::{Count, FacetCollector, TopDocs};
+use tantivy::collector::{Count, DocSetCollector, FacetCollector, TopDocs};
 use tantivy::query::{AllQuery, Query, QueryParser};
 use tantivy::schema::{FAST, Facet, FacetOptions, Field, INDEXED, STORED, Schema, TEXT, TantivyDocument, Value};
 use tantivy::{DateTime, DocAddress, Index, IndexReader, IndexWriter, Order, ReloadPolicy, Searcher, Term};
@@ -248,6 +252,23 @@ impl PhotoIndex {
         Ok(SearchResults { total, hits })
     }
 
+    /// Ids of every photo matching `query`.
+    pub fn matching_ids(&self, query: &str) -> Result<Vec<i64>> {
+        let searcher = self.reader.searcher();
+        let docs = searcher.search(&self.parse(query)?, &DocSetCollector)?;
+        let mut columns = Vec::new();
+        for segment in searcher.segment_readers() {
+            columns.push(segment.fast_fields().u64("id")?);
+        }
+        let mut ids: Vec<i64> = docs
+            .into_iter()
+            .filter_map(|a| columns[a.segment_ord as usize].first(a.doc_id))
+            .map(|id| id as i64)
+            .collect();
+        ids.sort_unstable();
+        Ok(ids)
+    }
+
     /// Counts matches of `query` under each child of `parent` in facet `field`.
     /// Sorted by count, highest first.
     pub fn facets(&self, query: &str, field: &str, parent: &str) -> Result<Vec<FacetCount>> {
@@ -377,6 +398,39 @@ impl PhotoIndex {
     }
 }
 
+/// Splits a smart search into (field terms, description): `dog on a beach
+/// year:2024 camera:"/FUJIFILM"` gives `year:2024 camera:"/FUJIFILM"` and
+/// `dog on a beach`. Quotes and `[a TO b]` ranges stay with their field.
+pub fn split_smart(query: &str) -> (String, String) {
+    let mut terms: Vec<String> = Vec::new();
+    let (mut cur, mut quoted, mut depth) = (String::new(), false, 0u32);
+    for c in query.chars() {
+        match c {
+            '"' => quoted = !quoted,
+            '[' | '{' if !quoted => depth += 1,
+            ']' | '}' if !quoted => depth = depth.saturating_sub(1),
+            c if c.is_whitespace() && !quoted && depth == 0 => {
+                if !cur.is_empty() {
+                    terms.push(std::mem::take(&mut cur));
+                }
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(c);
+    }
+    if !cur.is_empty() {
+        terms.push(cur);
+    }
+    let is_field = |t: &str| {
+        let t = t.trim_start_matches(['+', '-']);
+        t.split_once(':')
+            .is_some_and(|(name, _)| !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+    };
+    let (fields, words): (Vec<String>, Vec<String>) = terms.into_iter().partition(|t| is_field(t));
+    (fields.join(" "), words.join(" "))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -460,6 +514,24 @@ mod tests {
         assert_eq!(ids(&idx, "camera:\"/Canon\""), vec![1]);
         assert_eq!(ids(&idx, "canon nikon"), Vec::<i64>::new(), "terms are ANDed");
         assert!(matches!(idx.search("iso:>>", Sort::Relevance, 10, 0), Err(Error::Query(_))));
+    }
+
+    #[test]
+    fn smart_split() {
+        let split = |q: &str| split_smart(q);
+        assert_eq!(split("dog on a beach"), ("".into(), "dog on a beach".into()));
+        assert_eq!(
+            split(r#"dog  year:2024 on camera:"/FUJIFILM/X-T5" a beach focal:[70 TO 200] -tag:x"#),
+            (r#"year:2024 camera:"/FUJIFILM/X-T5" focal:[70 TO 200] -tag:x"#.into(), "dog on a beach".into())
+        );
+        assert_eq!(split(":) smile"), ("".into(), ":) smile".into()));
+    }
+
+    #[test]
+    fn matching_ids_follows_filters() {
+        let idx = sample();
+        assert_eq!(idx.matching_ids("").unwrap(), vec![1, 2, 3]);
+        assert_eq!(idx.matching_ids("year:[2020 TO 2024] iso:<1000").unwrap(), vec![2]);
     }
 
     #[test]

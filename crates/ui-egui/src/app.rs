@@ -13,14 +13,16 @@ use eframe::egui::{
 };
 use serde::{Deserialize, Serialize};
 use tintype_engine::{
-    Command, Engine, Event, FacetCount, Hit, PhotoRecord, PhotoRef, Response, ScanProgress, Sort, Stats,
+    Command, Engine, Event, FacetCount, Hit, PhotoRecord, PhotoRef, Response, ScanProgress, Sort, Stats, split_smart,
 };
 
 use crate::backend::{Backend, Job, Msg};
 use crate::thumbs::{Slot, Thumbs};
 
 mod people;
+mod smart;
 use people::PeopleState;
+use smart::SmartState;
 
 /// Upper bound on hits loaded into the grid.
 const SEARCH_LIMIT: usize = 200_000;
@@ -46,11 +48,13 @@ const STAR: Color32 = Color32::from_rgb(242, 184, 48);
 struct Settings {
     thumb_size: f32,
     sort: Sort,
+    /// Smart search: match the words by what the photos show.
+    smart: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { thumb_size: 160.0, sort: Sort::Newest }
+        Self { thumb_size: 160.0, sort: Sort::Newest, smart: false }
     }
 }
 
@@ -84,6 +88,8 @@ pub struct ScreenshotPlan {
     pub select: Option<usize>,
     /// "loupe", "people" or "person" (the first person's page).
     pub view: Option<String>,
+    /// Run this smart search first (an empty string shows smart mode with no query).
+    pub smart_query: Option<String>,
 }
 
 struct Screenshot {
@@ -100,6 +106,7 @@ pub struct TintypeApp {
     settings: Settings,
     tab: Tab,
     people: PeopleState,
+    smart: SmartState,
     /// Photo to open once the next search returns (from a face on the People tab).
     pending_open: Option<i64>,
 
@@ -152,6 +159,7 @@ impl TintypeApp {
             settings,
             tab: Tab::Photos,
             people: PeopleState::default(),
+            smart: SmartState::default(),
             pending_open: None,
             query: String::new(),
             search_box: None,
@@ -185,6 +193,10 @@ impl TintypeApp {
                 saved: Arc::default(),
             }),
         };
+        if let Some(q) = app.screenshot.as_ref().and_then(|s| s.plan.smart_query.clone()) {
+            app.settings.smart = true;
+            app.query = q;
+        }
         app.refresh_stats();
         app.search();
         app
@@ -200,10 +212,22 @@ impl TintypeApp {
         q
     }
 
+    /// What facet counts are taken over: in smart mode the words rank rather
+    /// than filter, so facets count the photos the field terms allow.
+    fn facet_query(&self) -> String {
+        let q = self.full_query();
+        if self.settings.smart { split_smart(&q).0 } else { q }
+    }
+
     fn search(&mut self) {
         self.search_due = None;
-        let cmd =
-            Command::Search { query: self.full_query(), sort: self.settings.sort, limit: SEARCH_LIMIT, offset: 0 };
+        let cmd = Command::Search {
+            query: self.full_query(),
+            smart: self.settings.smart,
+            sort: self.settings.sort,
+            limit: SEARCH_LIMIT,
+            offset: 0,
+        };
         self.search_seq = self.backend.send(Job::Search, cmd);
         self.folder_base = "/".into();
         for &(_, field) in FACETS {
@@ -220,7 +244,7 @@ impl TintypeApp {
     }
 
     fn request_facet(&mut self, field: &'static str) {
-        let cmd = Command::Facets { field: field.into(), query: self.full_query(), parent: self.facet_parent(field) };
+        let cmd = Command::Facets { field: field.into(), query: self.facet_query(), parent: self.facet_parent(field) };
         let seq = self.backend.send(Job::Facets(field), cmd);
         self.facet_seqs.insert(field, seq);
     }
@@ -289,7 +313,7 @@ impl TintypeApp {
     }
 
     fn on_progress(&mut self, event: Event) {
-        if self.on_face_progress(event) {
+        if self.on_analyze_progress(event) || self.on_face_progress(event) {
             return;
         }
         let Some(scan) = &mut self.scan else { return };
@@ -302,12 +326,12 @@ impl TintypeApp {
             Event::Reindex { done, total } => {
                 ("Updating search index…".into(), Some(done as f32 / total.max(1) as f32))
             }
-            Event::Download { .. } | Event::Faces { .. } => return,
+            Event::Download { .. } | Event::Faces { .. } | Event::Analyze { .. } => return,
         };
     }
 
     fn on_reply(&mut self, job: Job, seq: u64, result: Result<Response, String>) {
-        if self.on_people_reply(job, seq, &result) {
+        if self.on_people_reply(job, seq, &result) || self.on_analyze_reply(job, &result) {
             return;
         }
         match (job, result) {
@@ -451,11 +475,16 @@ impl TintypeApp {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| self.library_buttons(ui));
                 return;
             }
-            let search_width = (ui.available_width() - 470.0).max(220.0);
+            let search_width = (ui.available_width() - 550.0).max(220.0);
+            let hint = if self.settings.smart {
+                "Describe it: dog on a beach   red car at night   year:2024"
+            } else {
+                "Search: beach   make:fujifilm   iso:>1600   year:2024   rating:>=4"
+            };
             let resp = ui.add(
                 TextEdit::singleline(&mut self.query)
                     .id_salt("tintype-search")
-                    .hint_text("Search: beach   make:fujifilm   iso:>1600   year:2024   rating:>=4")
+                    .hint_text(hint)
                     .desired_width(search_width),
             );
             self.search_box = Some(resp.id);
@@ -469,17 +498,32 @@ impl TintypeApp {
                 self.query.clear();
                 self.search();
             }
+            if ui
+                .toggle_value(&mut self.settings.smart, "Smart")
+                .on_hover_text(
+                    "Find photos by what they show: \"dog on a beach\", \"red car at night\".\n\
+                     Field terms like year:2024 or rating:>=4 still filter. Best matches come first.",
+                )
+                .changed()
+            {
+                self.search();
+            }
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 self.library_buttons(ui);
                 ui.add(egui::Slider::new(&mut self.settings.thumb_size, 96.0..=320.0).show_value(false))
                     .on_hover_text("Thumbnail size");
                 let before = self.settings.sort;
-                egui::ComboBox::from_id_salt("sort").selected_text(sort_label(self.settings.sort)).show_ui(ui, |ui| {
-                    for s in [Sort::Newest, Sort::Oldest, Sort::Relevance] {
-                        ui.selectable_value(&mut self.settings.sort, s, sort_label(s));
-                    }
-                });
+                ui.add_enabled_ui(!self.settings.smart, |ui| {
+                    let label = if self.settings.smart { "Best match" } else { sort_label(self.settings.sort) };
+                    egui::ComboBox::from_id_salt("sort").selected_text(label).show_ui(ui, |ui| {
+                        for s in [Sort::Newest, Sort::Oldest, Sort::Relevance] {
+                            ui.selectable_value(&mut self.settings.sort, s, sort_label(s));
+                        }
+                    });
+                })
+                .response
+                .on_disabled_hover_text("Smart search shows the best matches first");
                 if self.settings.sort != before {
                     self.search();
                 }
@@ -493,6 +537,7 @@ impl TintypeApp {
         if let Some(err) = &self.query_error {
             ui.colored_label(ui.visuals().error_fg_color, err);
         }
+        self.smart_banner(ui);
         if !self.filters.is_empty() {
             let mut remove = None;
             let mut clear = false;

@@ -10,6 +10,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::Serialize;
 use tintype_meta::PhotoMeta;
 
+mod embeddings;
 mod faces;
 pub use faces::{FaceGroup, FaceInfo, FaceRow, NewFace, Person, Suggestion};
 
@@ -81,6 +82,14 @@ const MIGRATIONS: &[&str] = &[
     r#"
     -- How well a suggested face matched its person (higher is more likely).
     ALTER TABLE faces ADD COLUMN suggest_score REAL;
+"#,
+    r#"
+    -- Image embeddings for semantic search; one per analyzed photo.
+    CREATE TABLE embeddings (
+        photo_id INTEGER PRIMARY KEY REFERENCES photos(id) ON DELETE CASCADE,
+        vector   BLOB NOT NULL
+    );
+    ALTER TABLE photos ADD COLUMN analysis_version INTEGER NOT NULL DEFAULT 0;
 "#,
 ];
 
@@ -185,9 +194,11 @@ impl Catalog {
                     -- Same size and mtime means same content: keep a hash we didn't recompute.
                     hash = CASE WHEN excluded.size = photos.size AND excluded.mtime_ns = photos.mtime_ns
                                 THEN COALESCE(excluded.hash, photos.hash) ELSE excluded.hash END,
-                    -- Changed pixels need a new face pass.
+                    -- Changed pixels need new face and image analysis passes.
                     faces_version = CASE WHEN excluded.size = photos.size AND excluded.mtime_ns = photos.mtime_ns
                                 THEN photos.faces_version ELSE 0 END,
+                    analysis_version = CASE WHEN excluded.size = photos.size AND excluded.mtime_ns = photos.mtime_ns
+                                THEN photos.analysis_version ELSE 0 END,
                     size = excluded.size, mtime_ns = excluded.mtime_ns,
                     meta = excluded.meta, meta_version = excluded.meta_version,
                     error = excluded.error, indexed_at = excluded.indexed_at
@@ -340,6 +351,14 @@ fn read_row(r: &Row) -> rusqlite::Result<RawRecord> {
         },
         meta_json: r.get(5)?,
     })
+}
+
+fn to_blob(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+fn from_blob(b: &[u8]) -> Vec<f32> {
+    b.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect()
 }
 
 fn unix_now() -> i64 {

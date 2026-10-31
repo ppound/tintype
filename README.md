@@ -3,8 +3,8 @@
 Index, search and tag your photo library. One binary, no Java, Docker, WSL2 or
 Python. A Rust rewrite of [PhotoStat](https://github.com/ppound/photostat).
 
-Status: indexing, search, the desktop app and face recognition work. Image
-analysis (semantic search, auto-tags, aesthetic score) is next (see [Roadmap](#roadmap)).
+Status: indexing, search, the desktop app, face recognition and smart
+(semantic) search work. Auto-tags and near-duplicates are next (see [Roadmap](#roadmap)).
 
 ## Desktop app
 
@@ -26,9 +26,15 @@ nothing is moved or changed. You get:
   you to confirm. Faces show as boxes in the full-size view (F toggles them)
   and in the details panel, and `person:` / the People facet find their photos.
 
-Face recognition runs entirely on your computer; nothing is uploaded. The first
+- **Smart** search, a toggle beside the search bar: describe what's in the
+  picture ("dog on a beach", "red car at night") and the best matches come
+  first. Field terms like `year:2024` or `rating:>=4` still filter. Tintype
+  looks at each photo once first (**Analyze photos**, about 0.15 s per photo).
+
+Face recognition and smart search run entirely on your computer; nothing is uploaded. The first
 run downloads two small open models (YuNet, MIT; SFace, Apache-2.0; 39 MB in
-total), verified by SHA-256.
+total), verified by SHA-256. Smart search downloads Google's SigLIP B/16
+(Apache-2.0, 815 MB) the first time.
 
 ## Command line
 
@@ -45,6 +51,8 @@ tintype-cli rate 678 5
 tintype-cli faces                           # find faces in photos not yet checked
 tintype-cli people                          # named people and unnamed groups
 tintype-cli name "Ada" 113 681 871          # name faces (ids from `people`)
+tintype-cli analyze                         # embed photos for smart search
+tintype-cli search --smart dog on a beach year:2024
 ```
 
 The library (catalog, index and thumbnail cache) lives in the OS data folder,
@@ -68,6 +76,10 @@ All terms must match.
 | `gps:true`                     | photos with a location                      |
 | `camera:"/FUJIFILM/X-T5"` `ext:/raf` `folder:"/C:/Users/me/Pictures/2024"` | facets |
 
+With `--smart` (the app's **Smart** toggle), terms with a `field:` still filter as
+above and the remaining words are matched against what the photos show. Results are
+ranked by match; photos far behind the best match are left out.
+
 Facet fields for `tintype-cli facets`: `camera`, `lenses`, `date`, `ext`, `tags`, `people`, `folder`.
 
 ## Architecture
@@ -79,11 +91,11 @@ depend on crates in lower layers (`cargo xtask layers`).
 layer 0  codecs  infer  testkit
 layer 1  meta
 layer 2  catalog
-layer 3  index  analyze*  faces
+layer 3  index  analyze  faces
 layer 4  jobs
 layer 5  engine
 layer 6  ui-egui
-layer 7  apps/tintype (desktop)  apps/tintype-cli          (* = placeholder)
+layer 7  apps/tintype (desktop)  apps/tintype-cli
 ```
 
 | Crate      | Role |
@@ -91,11 +103,11 @@ layer 7  apps/tintype (desktop)  apps/tintype-cli          (* = placeholder)
 | `meta`     | EXIF extraction in pure Rust (JPEG, TIFF-based RAW, Fujifilm RAF, HEIF, PNG, WebP) |
 | `catalog`  | SQLite: the source of truth for photos, extracted metadata, ratings and tags |
 | `index`    | tantivy full-text, numeric and facet search. Derived from the catalog and rebuilt automatically when missing, outdated or out of sync |
-| `jobs`     | Incremental parallel scanning; batched face passes and people matching. All report progress and can be cancelled |
+| `jobs`     | Incremental parallel scanning; batched face and analysis passes; people matching. All report progress and can be cancelled |
 | `engine`   | Command registry. CLI, GUI and automation all run the same serde `Command`s |
 | `codecs`   | Thumbnails and previews: DCT-scaled JPEG decoding, RAF embedded JPEGs, a disk thumbnail cache. HEIC and other RAW formats are *planned* |
 | `infer`    | Model registry, verified downloads, and ONNX inference on `tract` (pure Rust, no native libraries). An ONNX Runtime backend for large models and GPUs is *planned* |
-| `analyze`  | *planned*: perceptual hashes, CLIP embeddings, semantic search, auto-tags, aesthetic score |
+| `analyze`  | SigLIP image and text embeddings for smart search. Near-duplicates, auto-tags and an aesthetic score are *planned* |
 | `faces`    | YuNet detection, landmark alignment, SFace embeddings, Chinese Whispers grouping, k-nearest matching |
 | `ui-egui`  | The desktop UI. The engine runs on its own thread and thumbnails decode on a worker pool, newest request first |
 
@@ -112,8 +124,10 @@ Design rules:
   Grouping links individually similar pairs; suggestions use a person's 3 best
   matching confirmed faces. Thresholds were tuned on a real library: a wrong
   merge is worse than a split, since naming two groups the same merges them.
-- **Long jobs run in batches** (face passes: 150 photos), so the app stays responsive and other
-  commands run in between.
+- **Long jobs run in batches** (face passes: 150 photos, analysis: 200), so the app stays
+  responsive and other commands run in between.
+- **Models run as exported, in fp32.** On tract, int8-quantized SigLIP was ~60x slower and
+  fp16 ~2x slower even translated to f32, so the smaller downloads aren't worth it there.
 
 ## Development
 
@@ -125,7 +139,8 @@ Tests use synthetic photos from `testkit`; no photo corpus is needed.
 
 `TINTYPE_SCREENSHOT=out.png tintype` runs the app until thumbnails settle, saves
 a screenshot and exits. `TINTYPE_SCREENSHOT_SELECT=<n>` selects a result first,
-and `TINTYPE_SCREENSHOT_VIEW=loupe` opens it full size.
+`TINTYPE_SCREENSHOT_VIEW=loupe` opens it full size, and
+`TINTYPE_SCREENSHOT_SMART="dog on a beach"` runs a smart search.
 
 ## Roadmap
 
@@ -134,6 +149,7 @@ and `TINTYPE_SCREENSHOT_VIEW=loupe` opens it full size.
    Next: RAF sensor dimensions, HEIC and other RAW previews, app icon, paging for very large result sets
 3. ~~Faces: detect, group, name, suggest, merge~~
    Next: faster face passes, HEIC/DNG previews for detection, scaling grouping past ~20k faces
-4. CLIP: semantic search, auto-tags, aesthetic score, near-duplicates
+4. ~~Smart search (SigLIP embeddings)~~
+   Next: near-duplicates (perceptual hash), zero-shot auto-tags, aesthetic score
 5. Packaging: MSI, DMG, AppImage from CI
 6. Import PhotoStat sidecars (JSON/XMP) so existing names and tags carry over

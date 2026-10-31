@@ -11,6 +11,7 @@ directories.workspace = true
 dunce.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+tintype-analyze.workspace = true
 tintype-catalog.workspace = true
 tintype-codecs.workspace = true
 tintype-faces.workspace = true

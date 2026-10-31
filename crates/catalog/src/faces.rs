@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
 
-use crate::{Catalog, Result};
+use crate::{Catalog, Result, from_blob, to_blob};
 
 /// A face from detection, before it has an id.
 #[derive(Debug, Clone)]
@@ -99,14 +99,6 @@ fn read_info(r: &rusqlite::Row) -> rusqlite::Result<FaceInfo> {
         person: r.get(7)?,
         confirmed: r.get(8)?,
     })
-}
-
-fn to_blob(v: &[f32]) -> Vec<u8> {
-    v.iter().flat_map(|x| x.to_le_bytes()).collect()
-}
-
-fn from_blob(b: &[u8]) -> Vec<f32> {
-    b.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect()
 }
 
 fn iou(a: [f32; 4], b: [f32; 4]) -> f32 {

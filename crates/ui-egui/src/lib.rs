@@ -19,6 +19,7 @@ pub fn run(library: Option<PathBuf>) -> Result<(), String> {
         path: path.into(),
         select: std::env::var("TINTYPE_SCREENSHOT_SELECT").ok().and_then(|v| v.parse().ok()),
         view: std::env::var("TINTYPE_SCREENSHOT_VIEW").ok(),
+        smart_query: std::env::var("TINTYPE_SCREENSHOT_SMART").ok(),
     });
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

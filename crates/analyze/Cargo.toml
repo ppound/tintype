@@ -7,3 +7,8 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+image.workspace = true
+thiserror.workspace = true
+tintype-codecs.workspace = true
+tintype-infer.workspace = true
+tokenizers.workspace = true
