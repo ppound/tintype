@@ -224,3 +224,12 @@ a screenshot and exits. `TINTYPE_SCREENSHOT_SELECT=<n>` selects a result first,
 5. Packaging: MSI, DMG, AppImage from CI
 6. ~~Read and write PhotoStat XMP sidecars~~
    Next: import PhotoStat's JSON data, if any; use `photostat:place`
+
+## License
+
+Tintype is dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
+Copyright (c) 2026 Paul Pound and the Tintype contributors.
+
+The models Tintype downloads on first use are not part of this repository and keep their own
+licenses: YuNet (MIT), SFace (Apache-2.0), SigLIP (Apache-2.0), CLIP ViT-L/14 (MIT) and the
+LAION aesthetic predictor (Apache-2.0).
