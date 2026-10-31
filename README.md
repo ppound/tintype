@@ -36,8 +36,10 @@ To build from source instead (Rust 1.95+): `cargo run --release -p tintype`.
 
 ## Desktop app
 
-Click **Add folder…** to add your photos. Tintype reads them where they are and
-never changes, moves or deletes a photo. You get:
+Click **Add folder…** to add your photos, and choose which kinds of file to include:
+JPEG, RAW, HEIC/AVIF, PNG/TIFF/WebP (e.g. JPEGs only, leaving the raw files out). Tintype
+remembers the choice for that folder when it rescans; a folder inside another one can have
+its own. Tintype reads photos where they are and never changes, moves or deletes one. You get:
 
 - a search bar (same syntax as below), with facet filters for camera, lens,
   date, tags, file type and folder in the sidebar
@@ -125,6 +127,7 @@ total), verified by SHA-256. Smart search downloads Google's SigLIP B/16
 
 ```sh
 tintype-cli scan ~/Pictures                 # first scan reads everything
+tintype-cli scan ~/Pictures --types jpeg     # only JPEGs from this folder (also: raw, heif, other)
 tintype-cli rescan                          # later scans only read new/changed files
 tintype-cli search beach sunset             # one line per stack; --unstacked lists every photo
 tintype-cli search "make:fujifilm iso:>1600" --sort newest
@@ -241,7 +244,8 @@ The icon is drawn by `assets/icon/make_icon.py`.
 `TINTYPE_SCREENSHOT=out.png tintype` runs the app until thumbnails settle, saves
 a screenshot and exits. `TINTYPE_SCREENSHOT_SELECT=<n>` selects a result first,
 `TINTYPE_SCREENSHOT_VIEW=loupe` opens it full size (`stack`: opens the first stack), and
-`TINTYPE_SCREENSHOT_SMART="dog on a beach"` runs a smart search.
+`TINTYPE_SCREENSHOT_SMART="dog on a beach"` runs a smart search, and
+`TINTYPE_SCREENSHOT_ADD=<folder>` opens the add-folder dialog.
 
 ## Roadmap
 

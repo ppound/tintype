@@ -26,6 +26,7 @@ pub use tintype_catalog::{FaceGroup, FaceInfo, Person, PhotoRecord};
 pub use tintype_codecs::{self as codecs, Rgba, ThumbCache, decode_preview};
 pub use tintype_index::{FACET_FIELDS, FacetCount, Hit, SearchResults, Sort, split_smart};
 pub use tintype_jobs::{AnalyzeReport, FacesReport, ScanProgress, ScanReport, SidecarReport, face_crop_path};
+pub use tintype_meta::FileKind;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -69,6 +70,10 @@ pub enum Command {
         roots: Vec<PathBuf>,
         #[serde(default = "yes")]
         hash: bool,
+        /// Include only these kinds of file from these folders (remembered for
+        /// rescans). `None` keeps a folder's earlier choice; new folders include all.
+        #[serde(default)]
+        kinds: Option<Vec<FileKind>>,
     },
     /// Refresh every folder previously added with `Scan`. Folders that are
     /// currently missing (an unplugged drive) are skipped, not emptied.
@@ -244,6 +249,8 @@ pub struct Stats {
     pub photos: u64,
     pub indexed: u64,
     pub folders: Vec<String>,
+    /// The kinds of file each folder includes, in `folders` order (`None`: all).
+    pub folder_kinds: Vec<Option<Vec<FileKind>>>,
     /// Photos not yet fully analyzed (smart search, sharpness, aesthetic score)...
     pub unanalyzed: u64,
     /// ...and the passes over photos that this takes (a photo may need two):
@@ -397,7 +404,17 @@ impl Engine {
     pub fn execute(&mut self, cmd: Command, events: &mut dyn FnMut(Event)) -> Result<Response> {
         self.cancel.store(false, Ordering::Relaxed);
         match cmd {
-            Command::Scan { roots, hash } => self.scan(&roots, hash, events).map(Response::Scan),
+            Command::Scan { roots, hash, kinds } => {
+                if let Some(kinds) = &kinds {
+                    for root in &roots {
+                        let root = tintype_jobs::normalize_path(root)
+                            .map_err(|source| Error::Library { path: root.clone(), source })?;
+                        let all = FileKind::ALL.iter().all(|k| kinds.contains(k));
+                        self.catalog.set_root_kinds(&root.display().to_string(), (!all).then_some(kinds.as_slice()))?;
+                    }
+                }
+                self.scan(&roots, hash, events).map(Response::Scan)
+            }
             Command::Rescan { hash } => {
                 let roots: Vec<PathBuf> =
                     self.catalog.roots()?.into_iter().map(PathBuf::from).filter(|r| r.is_dir()).collect();
@@ -465,6 +482,7 @@ impl Engine {
                 photos: self.catalog.count()?,
                 indexed: self.index.doc_count(),
                 folders: self.catalog.roots()?,
+                folder_kinds: self.catalog.root_kinds()?.into_iter().map(|(_, k)| k).collect(),
                 unanalyzed: self.catalog.count_needing_any_analysis(
                     ANALYSIS_VERSION,
                     SHARPNESS_VERSION,
@@ -836,7 +854,9 @@ impl Engine {
     }
 
     fn scan(&mut self, roots: &[PathBuf], hash: bool, events: &mut dyn FnMut(Event)) -> Result<ScanReport> {
-        let opts = ScanOptions { hash, ..ScanOptions::default() };
+        let folder_kinds =
+            self.catalog.root_kinds()?.into_iter().map(|(path, kinds)| (PathBuf::from(path), kinds)).collect();
+        let opts = ScanOptions { hash, folder_kinds, ..ScanOptions::default() };
         let mut report =
             tintype_jobs::scan(&mut self.catalog, roots, &opts, &self.cancel, &mut |p| events(Event::Scan(p)))?;
         self.catalog.add_roots(&report.roots)?;
@@ -997,7 +1017,7 @@ mod tests {
         let lib = tempfile::tempdir().unwrap();
 
         let mut engine = Engine::open(lib.path()).unwrap();
-        let scan = Command::Scan { roots: vec![photos.path().into()], hash: true };
+        let scan = Command::Scan { roots: vec![photos.path().into()], hash: true, kinds: None };
         let Response::Scan(report) = engine.execute(scan, &mut |_| {}).unwrap() else { panic!() };
         assert_eq!(report.added, 2);
 
@@ -1052,7 +1072,9 @@ mod tests {
         JpegSpec::canon().write(&photos.path().join("canon.jpg"));
         let lib = tempfile::tempdir().unwrap();
         let mut engine = Engine::open(lib.path()).unwrap();
-        engine.execute(Command::Scan { roots: vec![photos.path().into()], hash: false }, &mut |_| {}).unwrap();
+        engine
+            .execute(Command::Scan { roots: vec![photos.path().into()], hash: false, kinds: None }, &mut |_| {})
+            .unwrap();
         // No description words: no models are needed.
         let cmd = Command::Search {
             query: "iso:>=1000".into(),
@@ -1079,8 +1101,9 @@ mod tests {
         tintype_meta::xmp::write_sidecar(&a, &sidecar).unwrap();
         let lib = tempfile::tempdir().unwrap();
         let mut engine = Engine::open(lib.path()).unwrap();
-        let Response::Scan(r) =
-            engine.execute(Command::Scan { roots: vec![photos.path().into()], hash: true }, &mut |_| {}).unwrap()
+        let Response::Scan(r) = engine
+            .execute(Command::Scan { roots: vec![photos.path().into()], hash: true, kinds: None }, &mut |_| {})
+            .unwrap()
         else {
             panic!()
         };
@@ -1111,7 +1134,9 @@ mod tests {
         JpegSpec::canon().write(&a);
         let lib = tempfile::tempdir().unwrap();
         let mut engine = Engine::open(lib.path()).unwrap();
-        engine.execute(Command::Scan { roots: vec![photos.path().into()], hash: false }, &mut |_| {}).unwrap();
+        engine
+            .execute(Command::Scan { roots: vec![photos.path().into()], hash: false, kinds: None }, &mut |_| {})
+            .unwrap();
         drop(engine);
 
         // A sidecar import that reached the catalog but not the index (app closed midway).
@@ -1150,7 +1175,9 @@ mod tests {
         JpegSpec::nikon().write(&photos.path().join("other.jpg"));
         let lib = tempfile::tempdir().unwrap();
         let mut engine = Engine::open(lib.path()).unwrap();
-        engine.execute(Command::Scan { roots: vec![photos.path().into()], hash: true }, &mut |_| {}).unwrap();
+        engine
+            .execute(Command::Scan { roots: vec![photos.path().into()], hash: true, kinds: None }, &mut |_| {})
+            .unwrap();
 
         let stacked = Command::Search {
             query: String::new(),
@@ -1178,7 +1205,9 @@ mod tests {
         }
         let lib = tempfile::tempdir().unwrap();
         let mut engine = Engine::open(lib.path()).unwrap();
-        engine.execute(Command::Scan { roots: vec![photos.path().into()], hash: false }, &mut |_| {}).unwrap();
+        engine
+            .execute(Command::Scan { roots: vec![photos.path().into()], hash: false, kinds: None }, &mut |_| {})
+            .unwrap();
         let id = |engine: &Engine, n: &str| {
             let p = tintype_jobs::normalize_path(&photos.path().join(n)).unwrap();
             engine.catalog.get_by_path(&p.display().to_string()).unwrap().unwrap().id
@@ -1224,6 +1253,27 @@ mod tests {
         let Response::Search(r) = engine.execute(best, &mut |_| {}).unwrap() else { panic!() };
         let pos = |pid| r.hits.iter().position(|h| h.id == pid).unwrap();
         assert!(pos(loved) < 5 && pos(disliked) > 30, "{} {}", pos(loved), pos(disliked));
+    }
+
+    #[test]
+    fn a_folder_can_be_jpeg_only() {
+        let photos = tempfile::tempdir().unwrap();
+        JpegSpec::canon().write(&photos.path().join("a.jpg"));
+        std::fs::write(photos.path().join("a.RAF"), JpegSpec::canon().to_raf_bytes()).unwrap();
+        let lib = tempfile::tempdir().unwrap();
+        let mut engine = Engine::open(lib.path()).unwrap();
+        let scan = Command::Scan { roots: vec![photos.path().into()], hash: false, kinds: Some(vec![FileKind::Jpeg]) };
+        engine.execute(scan, &mut |_| {}).unwrap();
+        assert_eq!(hits(&mut engine, ""), vec!["a.jpg"]);
+        // Rescans remember the choice.
+        engine.execute(Command::Rescan { hash: false }, &mut |_| {}).unwrap();
+        assert_eq!(hits(&mut engine, ""), vec!["a.jpg"]);
+        let Response::Stats(s) = engine.execute(Command::Stats, &mut |_| {}).unwrap() else { panic!() };
+        assert_eq!(s.folder_kinds, vec![Some(vec![FileKind::Jpeg])]);
+        // Adding the folder again with every kind brings the RAF in.
+        let all = Command::Scan { roots: vec![photos.path().into()], hash: false, kinds: Some(FileKind::ALL.to_vec()) };
+        engine.execute(all, &mut |_| {}).unwrap();
+        assert_eq!(hits(&mut engine, "").len(), 2);
     }
 
     #[test]

@@ -13,7 +13,8 @@ use eframe::egui::{
 };
 use serde::{Deserialize, Serialize};
 use tintype_engine::{
-    Command, Engine, Event, FacetCount, Hit, PhotoRecord, PhotoRef, Response, ScanProgress, Sort, Stats, split_smart,
+    Command, Engine, Event, FacetCount, FileKind, Hit, PhotoRecord, PhotoRef, Response, ScanProgress, Sort, Stats,
+    split_smart,
 };
 
 use crate::backend::{Backend, Job, Msg, Reply};
@@ -50,13 +51,23 @@ struct Settings {
     sort: Sort,
     /// Smart search: match the words by what the photos show.
     smart: bool,
+    /// The kinds of file last chosen when adding a folder.
+    add_kinds: Vec<FileKind>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { thumb_size: 160.0, sort: Sort::Newest, smart: false }
+        Self { thumb_size: 160.0, sort: Sort::Newest, smart: false, add_kinds: FileKind::ALL.to_vec() }
     }
 }
+
+/// (kind, label, what it covers) for the add-folder dialog.
+const KIND_CHOICES: [(FileKind, &str, &str); 4] = [
+    (FileKind::Jpeg, "JPEG", ".jpg, .jpeg"),
+    (FileKind::Raw, "RAW", ".raf, .dng, .nef, .cr2, .cr3, .arw, ..."),
+    (FileKind::Heif, "HEIC / AVIF", ".heic, .heif, .avif"),
+    (FileKind::Other, "PNG / TIFF / WebP", ".png, .tif, .tiff, .webp"),
+];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -90,6 +101,8 @@ pub struct ScreenshotPlan {
     pub view: Option<String>,
     /// Run this smart search first (an empty string shows smart mode with no query).
     pub smart_query: Option<String>,
+    /// Open the add-folder dialog for this folder.
+    pub add_folder: Option<PathBuf>,
 }
 
 struct Screenshot {
@@ -111,6 +124,8 @@ pub struct TintypeApp {
     pending_open: Option<i64>,
     /// The stack being shown in full: (stack id, photos in it).
     open_stack: Option<(i64, u32)>,
+    /// A folder picked to add, waiting for the user to choose its file kinds.
+    adding_folder: Option<PathBuf>,
 
     query: String,
     /// The search box's widget id, for focusing it with Ctrl+F.
@@ -168,6 +183,7 @@ impl TintypeApp {
             smart: SmartState::default(),
             pending_open: None,
             open_stack: None,
+            adding_folder: None,
             query: String::new(),
             search_box: None,
             query_error: None,
@@ -202,6 +218,7 @@ impl TintypeApp {
                 saved: Arc::default(),
             }),
         };
+        app.adding_folder = app.screenshot.as_ref().and_then(|s| s.plan.add_folder.clone());
         if let Some(q) = app.screenshot.as_ref().and_then(|s| s.plan.smart_query.clone()) {
             app.settings.smart = true;
             app.query = q;
@@ -302,7 +319,54 @@ impl TintypeApp {
 
     fn add_folder(&mut self) {
         if let Some(dir) = rfd::FileDialog::new().set_title("Add a photo folder").pick_folder() {
-            self.start_scan(Command::Scan { roots: vec![dir], hash: true });
+            self.adding_folder = Some(dir);
+        }
+    }
+
+    /// After picking a folder: which kinds of file to include from it.
+    fn add_folder_dialog(&mut self, ctx: &egui::Context) {
+        let Some(dir) = self.adding_folder.clone() else { return };
+        let (mut add, mut cancel) = (false, false);
+        egui::Window::new("Add folder")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_max_width(420.0);
+                ui.label(RichText::new(dir.display().to_string()).strong());
+                ui.add_space(6.0);
+                ui.label("Include these kinds of file:");
+                for (kind, label, covers) in KIND_CHOICES {
+                    let mut on = self.settings.add_kinds.contains(&kind);
+                    let changed = ui
+                        .horizontal(|ui| {
+                            let c = ui.checkbox(&mut on, label).changed();
+                            ui.weak(covers);
+                            c
+                        })
+                        .inner;
+                    if changed {
+                        if on {
+                            self.settings.add_kinds.push(kind);
+                        } else {
+                            self.settings.add_kinds.retain(|k| *k != kind);
+                        }
+                    }
+                }
+                ui.add_space(4.0);
+                ui.weak("Tintype remembers this for the folder when it rescans. Files left out stay where they are.");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    add = ui.add_enabled(!self.settings.add_kinds.is_empty(), Button::new("Add folder")).clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+        if add {
+            let kinds = Some(self.settings.add_kinds.clone());
+            self.adding_folder = None;
+            self.start_scan(Command::Scan { roots: vec![dir], hash: true, kinds });
+        } else if cancel || ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.adding_folder = None;
         }
     }
 
@@ -1175,6 +1239,7 @@ impl eframe::App for TintypeApp {
         self.handle_keys(&ctx);
 
         let empty_library = self.stats.as_ref().is_some_and(|s| s.photos == 0) && self.scan.is_none();
+        self.add_folder_dialog(&ctx);
         egui::Panel::top("top").show(ui, |ui| self.top_bar(ui));
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
         if self.tab == Tab::People && !empty_library {

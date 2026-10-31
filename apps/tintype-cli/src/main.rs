@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use tintype_engine::{Command, Engine, Event, PhotoRecord, PhotoRef, Response, ScanProgress, Sort};
+use tintype_engine::{Command, Engine, Event, FileKind, PhotoRecord, PhotoRef, Response, ScanProgress, Sort};
 
 // The system allocator serializes the many small allocations of parallel image
 // decoding and inference; mimalloc lets face passes scale across cores.
@@ -35,6 +35,10 @@ enum Cmd {
         /// Skip content hashing (faster on slow disks; no exact-duplicate detection).
         #[arg(long)]
         no_hash: bool,
+        /// Include only these kinds of file, e.g. `--types jpeg` or `--types jpeg,raw`
+        /// (remembered for rescans; default: the folder's earlier choice, or all).
+        #[arg(long, value_delimiter = ',', value_enum)]
+        types: Option<Vec<KindArg>>,
     },
     /// Refresh every folder previously scanned.
     Rescan {
@@ -133,6 +137,29 @@ enum OnOff {
 }
 
 #[derive(Clone, Copy, ValueEnum)]
+enum KindArg {
+    /// .jpg, .jpeg
+    Jpeg,
+    /// camera raw: .raf, .dng, .nef, .cr2, .cr3, .arw, ...
+    Raw,
+    /// .heic, .heif, .avif
+    Heif,
+    /// .png, .tif, .tiff, .webp
+    Other,
+}
+
+impl KindArg {
+    fn kind(self) -> FileKind {
+        match self {
+            KindArg::Jpeg => FileKind::Jpeg,
+            KindArg::Raw => FileKind::Raw,
+            KindArg::Heif => FileKind::Heif,
+            KindArg::Other => FileKind::Other,
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
 enum SortArg {
     Relevance,
     Newest,
@@ -155,7 +182,11 @@ fn main() -> Result<()> {
     let mut engine = Engine::open(&library).with_context(|| format!("opening library {}", library.display()))?;
 
     let cmd = match cli.cmd {
-        Cmd::Scan { folders, no_hash } => Command::Scan { roots: folders, hash: !no_hash },
+        Cmd::Scan { folders, no_hash, types } => Command::Scan {
+            roots: folders,
+            hash: !no_hash,
+            kinds: types.map(|t| t.into_iter().map(KindArg::kind).collect()),
+        },
         Cmd::Rescan { no_hash } => Command::Rescan { hash: !no_hash },
         Cmd::Search { query, smart, unstacked, sort, limit, offset } => {
             let sort = match sort {
@@ -421,8 +452,14 @@ fn print_response(response: &Response) {
             println!("library  {}", s.library);
             println!("photos   {}", s.photos);
             println!("indexed  {}", s.indexed);
-            for f in &s.folders {
-                println!("folder   {f}");
+            for (f, kinds) in s.folders.iter().zip(&s.folder_kinds) {
+                match kinds {
+                    Some(k) => {
+                        let names: Vec<&str> = k.iter().map(|k| k.name()).collect();
+                        println!("folder   {f}  (only {})", names.join(", "));
+                    }
+                    None => println!("folder   {f}"),
+                }
             }
             if s.unanalyzed > 0 {
                 println!("\n{} photos not yet analyzed for smart search; run `tintype-cli analyze`.", s.unanalyzed);

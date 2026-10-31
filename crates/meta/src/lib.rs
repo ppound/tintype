@@ -232,9 +232,53 @@ fn all_fields(exif: &Exif) -> BTreeMap<String, String> {
 
 /// True if `path` has an extension in [`PHOTO_EXTENSIONS`].
 pub fn is_photo(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| PHOTO_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
+    file_kind(path).is_some()
+}
+
+/// The kinds of photo file a library folder can include or leave out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileKind {
+    /// `.jpg`, `.jpeg`
+    Jpeg,
+    /// Camera raw files: `.raf`, `.dng`, `.nef`, `.cr2`, ...
+    Raw,
+    /// `.heic`, `.heif`, `.avif`
+    Heif,
+    /// `.png`, `.tif`, `.tiff`, `.webp`
+    Other,
+}
+
+impl FileKind {
+    pub const ALL: [FileKind; 4] = [FileKind::Jpeg, FileKind::Raw, FileKind::Heif, FileKind::Other];
+
+    /// The name stored in the catalog and accepted on the command line.
+    pub fn name(self) -> &'static str {
+        match self {
+            FileKind::Jpeg => "jpeg",
+            FileKind::Raw => "raw",
+            FileKind::Heif => "heif",
+            FileKind::Other => "other",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| k.name() == name.trim())
+    }
+}
+
+/// What kind of photo `path` is, by extension; `None` if it isn't one.
+pub fn file_kind(path: &Path) -> Option<FileKind> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    if !PHOTO_EXTENSIONS.contains(&ext.as_str()) {
+        return None;
+    }
+    Some(match ext.as_str() {
+        "jpg" | "jpeg" | "jpe" => FileKind::Jpeg,
+        "heic" | "heif" | "avif" => FileKind::Heif,
+        "tif" | "tiff" | "png" | "webp" => FileKind::Other,
+        _ => FileKind::Raw,
+    })
 }
 
 #[cfg(test)]
@@ -293,5 +337,13 @@ mod tests {
         assert!(is_photo(Path::new("x/DSC_1.nef")));
         assert!(!is_photo(Path::new("x/notes.txt")));
         assert!(!is_photo(Path::new("x/noext")));
+        assert_eq!(file_kind(Path::new("a.JPG")), Some(FileKind::Jpeg));
+        assert_eq!(file_kind(Path::new("a.raf")), Some(FileKind::Raw));
+        assert_eq!(file_kind(Path::new("a.HEIC")), Some(FileKind::Heif));
+        assert_eq!(file_kind(Path::new("a.tiff")), Some(FileKind::Other));
+        assert_eq!(file_kind(Path::new("a.txt")), None);
+        for k in FileKind::ALL {
+            assert_eq!(FileKind::from_name(k.name()), Some(k));
+        }
     }
 }

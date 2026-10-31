@@ -15,6 +15,7 @@ use std::time::{Instant, UNIX_EPOCH};
 use rayon::prelude::*;
 use serde::Serialize;
 use tintype_catalog::{Catalog, NewPhoto};
+use tintype_meta::FileKind;
 use walkdir::WalkDir;
 
 #[derive(Debug, thiserror::Error)]
@@ -33,11 +34,16 @@ pub struct ScanOptions {
     pub hash: bool,
     /// Photos analyzed in parallel and written per catalog transaction.
     pub batch_size: usize,
+    /// The kinds of file each library folder includes (`None`: all). A photo
+    /// follows the innermost folder that contains it; photos in no listed
+    /// folder are all included. Files a folder leaves out are dropped from
+    /// the catalog (never from disk).
+    pub folder_kinds: Vec<(PathBuf, Option<Vec<FileKind>>)>,
 }
 
 impl Default for ScanOptions {
     fn default() -> Self {
-        Self { hash: true, batch_size: 256 }
+        Self { hash: true, batch_size: 256, folder_kinds: Vec::new() }
     }
 }
 
@@ -135,7 +141,7 @@ pub fn scan(
                     continue;
                 }
             };
-            if !entry.file_type().is_file() || !tintype_meta::is_photo(entry.path()) {
+            if !entry.file_type().is_file() || !included(entry.path(), &opts.folder_kinds) {
                 continue;
             }
             let (Some(path), Ok(md)) = (entry.path().to_str(), entry.metadata()) else {
@@ -179,10 +185,18 @@ pub fn scan(
     // A cancelled walk hasn't seen everything, so it can't tell what is gone.
     let mut gone: HashSet<i64> = HashSet::new();
     let mut gone_by_key: HashMap<MoveKey, Vec<i64>> = HashMap::new();
+    let mut left_out = Vec::new();
     if !report.cancelled {
         for (path, fp) in &known {
-            if !seen.contains(path) && roots.iter().any(|r| Path::new(path).starts_with(r)) && !Path::new(path).exists()
-            {
+            if seen.contains(path) || !roots.iter().any(|r| Path::new(path).starts_with(r)) {
+                continue;
+            }
+            if !included(Path::new(path), &opts.folder_kinds) {
+                // Its folder no longer includes this kind of file.
+                left_out.push(fp.id);
+                continue;
+            }
+            if !Path::new(path).exists() {
                 gone.insert(fp.id);
                 if let Some(h) = fp.hash {
                     gone_by_key.entry(MoveKey::Hash(h)).or_default().push(fp.id);
@@ -228,7 +242,7 @@ pub fn scan(
 
     // A scan cancelled while reading may not have reached a moved file yet; keep its old entry.
     if !report.cancelled {
-        report.removed_ids = gone.into_iter().collect();
+        report.removed_ids = gone.into_iter().chain(left_out).collect();
         report.removed_ids.sort_unstable();
         report.removed_face_ids = catalog.remove_many(&report.removed_ids)?;
         report.removed = report.removed_ids.len() as u64;
@@ -236,6 +250,19 @@ pub fn scan(
 
     report.elapsed_ms = started.elapsed().as_millis() as u64;
     Ok(report)
+}
+
+/// Whether `path` is a photo its innermost listed folder includes.
+fn included(path: &Path, folder_kinds: &[(PathBuf, Option<Vec<FileKind>>)]) -> bool {
+    let Some(kind) = tintype_meta::file_kind(path) else { return false };
+    let innermost = folder_kinds
+        .iter()
+        .filter(|(folder, _)| path.starts_with(folder))
+        .max_by_key(|(folder, _)| folder.components().count());
+    match innermost {
+        Some((_, Some(kinds))) => kinds.contains(&kind),
+        _ => true,
+    }
 }
 
 /// The one spelling under which a file is cataloged: absolute, symlinks and
@@ -390,6 +417,43 @@ mod tests {
             assert_eq!((r.moved, r.added, r.removed), (1, 0, 0), "hash: {hash}");
             assert_eq!(cat.count().unwrap(), 3);
         }
+    }
+
+    #[test]
+    fn folders_can_leave_file_kinds_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        for f in ["a.jpg", "a.RAF", "sub/b.jpg", "sub/b.dng", "sub/c.png"] {
+            std::fs::create_dir_all(root.join(f).parent().unwrap()).unwrap();
+            std::fs::write(root.join(f), JpegSpec::canon().to_bytes()).unwrap();
+        }
+        let mut cat = Catalog::open_in_memory().unwrap();
+        let run = |cat: &mut Catalog, kinds: Vec<(PathBuf, Option<Vec<FileKind>>)>| {
+            let opts = ScanOptions { folder_kinds: kinds, ..ScanOptions::default() };
+            scan(cat, std::slice::from_ref(&root), &opts, &AtomicBool::new(false), &mut |_| {}).unwrap()
+        };
+        let paths = |cat: &Catalog| {
+            let mut p: Vec<String> = cat.fingerprints().unwrap().into_keys().collect();
+            p.sort();
+            p.iter().map(|s| s.trim_start_matches(&root.display().to_string()).replace('\\', "/")).collect::<Vec<_>>()
+        };
+
+        // JPEG only.
+        let r = run(&mut cat, vec![(root.clone(), Some(vec![FileKind::Jpeg]))]);
+        assert_eq!(r.added, 2);
+        assert_eq!(paths(&cat), ["/a.jpg", "/sub/b.jpg"]);
+
+        // Everything, except that sub/ stays JPEG + PNG: the innermost folder decides.
+        let kinds = vec![(root.clone(), None), (root.join("sub"), Some(vec![FileKind::Jpeg, FileKind::Other]))];
+        let r = run(&mut cat, kinds);
+        assert_eq!(r.added, 2);
+        assert_eq!(paths(&cat), ["/a.RAF", "/a.jpg", "/sub/b.jpg", "/sub/c.png"]);
+
+        // Narrowing again drops the left-out files from the catalog, not from disk.
+        let r = run(&mut cat, vec![(root.clone(), Some(vec![FileKind::Jpeg]))]);
+        assert_eq!(r.removed, 2);
+        assert_eq!(paths(&cat), ["/a.jpg", "/sub/b.jpg"]);
+        assert!(root.join("a.RAF").exists() && root.join("sub/c.png").exists());
     }
 
     #[test]

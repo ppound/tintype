@@ -19,10 +19,10 @@ tintype-faces.workspace = true
 tintype-index.workspace = true
 tintype-infer.workspace = true
 tintype-jobs.workspace = true
+tintype-meta.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-tintype-meta.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 tintype-testkit.workspace = true

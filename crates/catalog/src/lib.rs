@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::Serialize;
-use tintype_meta::PhotoMeta;
+use tintype_meta::{FileKind, PhotoMeta};
 
 mod embeddings;
 mod faces;
@@ -134,6 +134,10 @@ const MIGRATIONS: &[&str] = &[
     -- Where the rating came from: 'user' (set in Tintype), 'sidecar', or NULL (older catalogs).
     -- Only the user's own ratings teach Tintype their taste.
     ALTER TABLE photos ADD COLUMN rating_source TEXT;
+"#,
+    r#"
+    -- The kinds of file a library folder includes ("jpeg,raw"); NULL: all.
+    ALTER TABLE roots ADD COLUMN kinds TEXT;
 "#,
 ];
 
@@ -369,6 +373,33 @@ impl Catalog {
         Ok(())
     }
 
+    /// Sets which kinds of file a folder includes (`None`: all), adding the folder if new.
+    pub fn set_root_kinds(&self, root: &str, kinds: Option<&[FileKind]>) -> Result<()> {
+        let kinds = kinds.map(|k| {
+            let mut k = k.to_vec();
+            k.sort();
+            k.dedup();
+            k.iter().map(|k| k.name()).collect::<Vec<_>>().join(",")
+        });
+        self.conn.execute(
+            "INSERT INTO roots (path, kinds) VALUES (?1, ?2) ON CONFLICT(path) DO UPDATE SET kinds = excluded.kinds",
+            params![root, kinds],
+        )?;
+        Ok(())
+    }
+
+    /// Every folder with the kinds of file it includes (`None`: all).
+    pub fn root_kinds(&self) -> Result<Vec<(String, Option<Vec<FileKind>>)>> {
+        let mut stmt = self.conn.prepare("SELECT path, kinds FROM roots ORDER BY path")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (path, kinds) = row?;
+            out.push((path, kinds.map(|k| k.split(',').filter_map(FileKind::from_name).collect())));
+        }
+        Ok(out)
+    }
+
     pub fn roots(&self) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare("SELECT path FROM roots ORDER BY path")?;
         let roots = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
@@ -555,6 +586,21 @@ mod tests {
         cat.add_roots(&["/b".into(), "/a".into()]).unwrap();
         cat.add_roots(&["/a".into()]).unwrap();
         assert_eq!(cat.roots().unwrap(), vec!["/a", "/b"]);
+    }
+
+    #[test]
+    fn folder_kinds() {
+        let cat = Catalog::open_in_memory().unwrap();
+        cat.add_roots(&["/a".into()]).unwrap();
+        cat.set_root_kinds("/b", Some(&[FileKind::Raw, FileKind::Jpeg, FileKind::Jpeg])).unwrap();
+        assert_eq!(
+            cat.root_kinds().unwrap(),
+            vec![("/a".to_string(), None), ("/b".to_string(), Some(vec![FileKind::Jpeg, FileKind::Raw]))]
+        );
+        cat.add_roots(&["/b".into()]).unwrap();
+        assert!(cat.root_kinds().unwrap()[1].1.is_some(), "adding again keeps the choice");
+        cat.set_root_kinds("/b", None).unwrap();
+        assert_eq!(cat.root_kinds().unwrap()[1].1, None);
     }
 
     #[test]
