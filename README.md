@@ -20,7 +20,7 @@ Download the installer for your system from [Releases](https://github.com/ppound
 | Windows 10/11 | `tintype_<version>_x64-setup.exe` | installs for your user only, no administrator rights |
 | macOS 11+, Apple Silicon | `Tintype_<version>_aarch64_macos-arm64.dmg` | drag Tintype to Applications |
 | macOS 11+, Intel | `Tintype_<version>_x64_macos-x64.dmg` | |
-| Linux | `.AppImage` (any distribution) or `.deb` (Debian, Ubuntu) | |
+| Linux | `tintype_<version>_x86_64.AppImage` (any distribution) or `tintype_<version>_amd64.deb` (Debian, Ubuntu) | |
 
 Both the app (`tintype`) and the command line (`tintype-cli`) are included.
 
@@ -30,7 +30,7 @@ The installers are not code-signed yet, so the first launch shows a warning:
 - **macOS**: "Apple could not verify Tintype". Open **System Settings > Privacy & Security**,
   scroll down and click **Open Anyway**. If macOS instead says the app "is damaged", run
   `xattr -dr com.apple.quarantine /Applications/Tintype.app` once in Terminal.
-- **Linux**: make the AppImage executable (`chmod +x Tintype*.AppImage`), then run it.
+- **Linux**: make the AppImage executable (`chmod +x tintype_*.AppImage`), then run it.
 
 To build from source instead (Rust 1.95+): `cargo run --release -p tintype`.
 
