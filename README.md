@@ -9,13 +9,32 @@ self-contained app, and its way of keeping your photos untouched. It reads Photo
 sidecars, so ratings, tags and people carry over.
 
 Status: indexing, search, the desktop app, face recognition, smart (semantic)
-search, duplicate stacking and quality scores work. Packaging is next (see [Roadmap](#roadmap)).
+search, duplicate stacking and quality scores work, on Windows, macOS and Linux.
+
+## Install
+
+Download the installer for your system from [Releases](https://github.com/ppound/tintype/releases):
+
+| System | File | |
+|--------|------|-|
+| Windows 10/11 | `tintype_<version>_x64-setup.exe` | installs for your user only, no administrator rights |
+| macOS 11+, Apple Silicon | `Tintype_<version>_aarch64_macos-arm64.dmg` | drag Tintype to Applications |
+| macOS 11+, Intel | `Tintype_<version>_x64_macos-x64.dmg` | |
+| Linux | `.AppImage` (any distribution) or `.deb` (Debian, Ubuntu) | |
+
+Both the app (`tintype`) and the command line (`tintype-cli`) are included.
+
+The installers are not code-signed yet, so the first launch shows a warning:
+
+- **Windows**: "Windows protected your PC". Click **More info**, then **Run anyway**.
+- **macOS**: "Apple could not verify Tintype". Open **System Settings > Privacy & Security**,
+  scroll down and click **Open Anyway**. If macOS instead says the app "is damaged", run
+  `xattr -dr com.apple.quarantine /Applications/Tintype.app` once in Terminal.
+- **Linux**: make the AppImage executable (`chmod +x Tintype*.AppImage`), then run it.
+
+To build from source instead (Rust 1.95+): `cargo run --release -p tintype`.
 
 ## Desktop app
-
-```sh
-cargo run --release -p tintype
-```
 
 Click **Add folder…** to add your photos. Tintype reads them where they are and
 never changes, moves or deletes a photo. You get:
@@ -211,6 +230,14 @@ cargo xtask ci        # fmt check, clippy -D warnings, tests, layer check
 
 Tests use synthetic photos from `testkit`; no photo corpus is needed.
 
+CI runs `cargo xtask ci` on Windows, macOS and Linux for every push and pull request.
+To release, bump `version` in `Cargo.toml`, then push a tag:
+`git tag v0.2.0 && git push origin v0.2.0`. The Release workflow builds the installers
+(see the table above) and attaches them to a draft GitHub Release to check and publish.
+Locally: `cargo build --release -p tintype -p tintype-cli`, then
+`cargo packager --release -p tintype --formats nsis` (or `app,dmg`, `deb,appimage`).
+The icon is drawn by `assets/icon/make_icon.py`.
+
 `TINTYPE_SCREENSHOT=out.png tintype` runs the app until thumbnails settle, saves
 a screenshot and exits. `TINTYPE_SCREENSHOT_SELECT=<n>` selects a result first,
 `TINTYPE_SCREENSHOT_VIEW=loupe` opens it full size (`stack`: opens the first stack), and
@@ -220,13 +247,14 @@ a screenshot and exits. `TINTYPE_SCREENSHOT_SELECT=<n>` selects a result first,
 
 1. ~~Indexer + CLI~~
 2. ~~egui shell: thumbnail grid, single-photo view, facet sidebar, search~~
-   Next: RAF sensor dimensions, HEIC and other RAW previews, app icon, paging for very large result sets
+   Next: RAF sensor dimensions, HEIC and other RAW previews, paging for very large result sets
 3. ~~Faces: detect, group, name, suggest, merge~~
    Next: faster face passes, HEIC/DNG previews for detection, scaling grouping past ~20k faces
 4. ~~Smart search (SigLIP embeddings)~~, ~~stacks of duplicates, versions and bursts~~,
    ~~aesthetic score, learned taste~~
    Next: zero-shot auto-tags, a review list for culling
-5. Packaging: MSI, DMG, AppImage from CI
+5. ~~Installers for Windows, macOS and Linux from CI; app icon~~
+   Next: code signing (Apple notarization, Windows signing), auto-update
 6. ~~Read and write PhotoStat XMP sidecars~~
    Next: import PhotoStat's JSON data, if any; use `photostat:place`
 

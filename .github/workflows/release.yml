@@ -1,0 +1,111 @@
+name: Release
+
+# Builds unsigned installers for Windows, macOS (Apple Silicon and Intel) and Linux.
+# - Push a tag `v*` (e.g. `git tag v0.1.0 && git push origin v0.1.0`): the installers are
+#   attached to a draft GitHub Release for that tag, to check and publish by hand.
+# - Run it from the Actions tab: the installers are kept as workflow artifacts only.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  PACKAGER_VERSION: 0.11.8
+
+jobs:
+  package:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            formats: nsis
+          - name: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            formats: app,dmg
+          - name: macos-x64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            formats: app,dmg
+          # The oldest supported runner, so the binaries run on older glibc too.
+          - name: linux-x64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            formats: deb,appimage
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: release-${{ matrix.target }}
+      - name: Linux libraries for the desktop app
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev libxcursor-dev \
+            libxrandr-dev libxi-dev libfontconfig1-dev libfreetype-dev libgl1-mesa-dev libdbus-1-dev \
+            libfuse2
+      - name: Install cargo-packager
+        run: cargo install --locked cargo-packager@${{ env.PACKAGER_VERSION }}
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} -p tintype -p tintype-cli
+      - name: Package
+        shell: bash
+        env:
+          # AppImage tools run without FUSE on CI runners.
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: cargo packager --release -p tintype --target ${{ matrix.target }} --formats ${{ matrix.formats }}
+      - name: Collect installers
+        shell: bash
+        run: |
+          mkdir -p out
+          find dist -maxdepth 1 -type f \( -name '*.exe' -o -name '*.dmg' -o -name '*.deb' -o -name '*.AppImage' \) \
+            -exec cp {} out/ \;
+          # Name macOS images by architecture; both builds would otherwise look alike.
+          for f in out/*.dmg; do [ -e "$f" ] && mv "$f" "${f%.dmg}_${{ matrix.name }}.dmg"; done
+          ls -la out
+          test -n "$(ls out)"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tintype-${{ matrix.name }}
+          path: out/*
+          if-no-files-found: error
+
+  draft-release:
+    name: Draft release
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: installers
+          merge-multiple: true
+      - name: Create or update the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          ls -la installers
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$TAG" installers/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" installers/* --draft --title "Tintype $TAG" --generate-notes \
+              --repo "$GITHUB_REPOSITORY"
+          fi

@@ -11,3 +11,40 @@ license.workspace = true
 mimalloc.workspace = true
 rfd.workspace = true
 tintype-ui-egui.workspace = true
+
+[build-dependencies]
+winresource = "0.1"
+
+# Installers: build `tintype` and `tintype-cli` in release mode, then
+# `cargo packager --release -p tintype --formats nsis` (see .github/workflows/release.yml).
+[package.metadata.packager]
+product-name = "Tintype"
+identifier = "io.github.ppound.tintype"
+category = "Photography"
+description = "Index, search and tag your photo library"
+long-description = "Tintype indexes your photos where they are and never changes them: search by camera, date, tags and people, find faces, search by what photos show, stack duplicates and bursts, and find your best shots."
+homepage = "https://github.com/ppound/tintype"
+authors = ["Paul Pound"]
+publisher = "Paul Pound"
+copyright = "Copyright (c) 2026 Paul Pound and the Tintype contributors"
+license-file = "../../LICENSE-MIT"
+out-dir = "../../dist"
+binaries = [{ path = "tintype", main = true }, { path = "tintype-cli" }]
+icons = [
+    "../../assets/icon/32x32.png",
+    "../../assets/icon/128x128.png",
+    "../../assets/icon/256x256.png",
+    "../../assets/icon/512x512.png",
+    "../../assets/icon/icon.icns",
+    "../../assets/icon/icon.ico",
+]
+
+[package.metadata.packager.nsis]
+# Per-user install: no administrator rights needed.
+installer-mode = "currentUser"
+
+[package.metadata.packager.deb]
+section = "graphics"
+
+[package.metadata.packager.macos]
+minimum-system-version = "11.0"

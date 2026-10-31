@@ -6,6 +6,7 @@ mod backend;
 mod thumbs;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use eframe::egui;
 use tintype_engine::Engine;
@@ -24,6 +25,10 @@ pub fn run(library: Option<PathBuf>) -> Result<(), String> {
     let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Tintype")
+            .with_icon(Arc::new(
+                eframe::icon_data::from_png_bytes(include_bytes!("../../../assets/icon/256x256.png"))
+                    .expect("the bundled icon is a valid PNG"),
+            ))
             .with_inner_size([1360.0, 860.0])
             .with_min_inner_size([760.0, 480.0]),
         ..Default::default()
