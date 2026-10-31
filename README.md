@@ -1,7 +1,12 @@
 # Tintype
 
 Index, search and tag your photo library. One binary, no Java, Docker, WSL2 or
-Python. A Rust rewrite of [PhotoStat](https://github.com/ppound/photostat).
+Python.
+
+Tintype is a Rust rewrite of [PhotoStat](https://github.com/ppound/photostat), inspired by
+[LightCraft](https://github.com/ppound/lightcraft): its layered crate architecture, its single
+self-contained app, and its way of keeping your photos untouched. It reads PhotoStat's XMP
+sidecars, so ratings, tags and people carry over.
 
 Status: indexing, search, the desktop app, face recognition, smart (semantic)
 search, duplicate stacking and quality scores work. Packaging is next (see [Roadmap](#roadmap)).
