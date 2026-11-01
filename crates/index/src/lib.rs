@@ -16,12 +16,14 @@
 //! | `person:alice` `faces:>=3`  | people (named faces) and face count         |
 //! | `subject:dog`               | auto tags (also matched by plain words)    |
 //! | `stack:12`                  | the photos of one stack                    |
+//! | `like:12`                   | looks like photo 12, most alike first      |
 //! | `aesthetic:>=6`             | LAION aesthetic score (when computed)      |
 //! | `gps:true`                  | has location                               |
 //!
 //! Smart (semantic) search is done by the engine: [`split_smart`] separates
 //! field terms, which still filter here via [`PhotoIndex::matching_ids`], from
-//! the description, which is matched against image embeddings.
+//! the description, which is matched against image embeddings. Likewise
+//! [`split_like`] takes out `like:<id>`, which the engine ranks by embedding.
 
 use std::path::{Component, Path, Prefix};
 
@@ -508,6 +510,34 @@ pub fn facet_filter(field: &str, path: &str) -> String {
 /// year:2024 camera:"/FUJIFILM"` gives `year:2024 camera:"/FUJIFILM"` and
 /// `dog on a beach`. Quotes and `[a TO b]` ranges stay with their field.
 pub fn split_smart(query: &str) -> (String, String) {
+    let is_field = |t: &str| {
+        let t = t.trim_start_matches(['+', '-']);
+        t.split_once(':')
+            .is_some_and(|(name, _)| !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+    };
+    let (fields, words): (Vec<String>, Vec<String>) = terms(query).into_iter().partition(|t| is_field(t));
+    (fields.join(" "), words.join(" "))
+}
+
+/// Takes `like:<photo id>` out of a query: `like:12 year:2024` gives `Some(12)`
+/// and `year:2024`. With several, the last one counts.
+pub fn split_like(query: &str) -> (Option<i64>, String) {
+    let mut like = None;
+    let rest: Vec<String> = terms(query)
+        .into_iter()
+        .filter(|t| match t.strip_prefix("like:").map(str::parse) {
+            Some(Ok(id)) => {
+                like = Some(id);
+                false
+            }
+            _ => true,
+        })
+        .collect();
+    (like, rest.join(" "))
+}
+
+/// The terms of a query, split at spaces outside quotes and `[a TO b]` ranges.
+fn terms(query: &str) -> Vec<String> {
     let mut terms: Vec<String> = Vec::new();
     let (mut cur, mut quoted, mut depth) = (String::new(), false, 0u32);
     for c in query.chars() {
@@ -528,13 +558,7 @@ pub fn split_smart(query: &str) -> (String, String) {
     if !cur.is_empty() {
         terms.push(cur);
     }
-    let is_field = |t: &str| {
-        let t = t.trim_start_matches(['+', '-']);
-        t.split_once(':')
-            .is_some_and(|(name, _)| !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
-    };
-    let (fields, words): (Vec<String>, Vec<String>) = terms.into_iter().partition(|t| is_field(t));
-    (fields.join(" "), words.join(" "))
+    terms
 }
 
 #[cfg(test)]
@@ -650,6 +674,16 @@ mod tests {
             (r#"year:2024 camera:"/FUJIFILM/X-T5" focal:[70 TO 200] -tag:x"#.into(), "dog on a beach".into())
         );
         assert_eq!(split(":) smile"), ("".into(), ":) smile".into()));
+    }
+
+    #[test]
+    fn like_split() {
+        assert_eq!(split_like("like:12"), (Some(12), "".into()));
+        assert_eq!(
+            split_like(r#"year:2024 like:7 camera:"/A B" like:12"#),
+            (Some(12), r#"year:2024 camera:"/A B""#.into())
+        );
+        assert_eq!(split_like("like:dogs beach"), (None, "like:dogs beach".into()), "not a photo id");
     }
 
     #[test]

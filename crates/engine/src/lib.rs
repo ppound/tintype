@@ -53,6 +53,8 @@ pub enum Error {
     PhotoNotFound(String),
     #[error("no library folders to rescan; add one first")]
     NoFolders,
+    #[error("photo {0} hasn't been analyzed yet, so there's nothing to compare it with")]
+    NotAnalyzed(i64),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -305,6 +307,15 @@ const SMART_MIN_PROBABILITY: f32 = 0.0003;
 /// 4,253-photo library by checking results at increasing depth.
 const SMART_WINDOW: f32 = 0.045;
 
+/// `like:` shows at most this many photos (before stacking), most alike first...
+const SIMILAR_LIMIT: usize = 150;
+/// ...that are at least this alike. Embeddings of any two photos score high
+/// (0.7 is typical 2,000 photos down), and no cutoff fits every photo: near
+/// copies score 0.9+, then the same kind of scene (other sunsets, the same
+/// person) follows smoothly, from 0.95 for a common subject to 0.75 for a rare
+/// one. So `like:` ranks a fixed number, and this floor only drops the unrelated.
+const SIMILAR_MIN: f32 = 0.7;
+
 /// Library setting: the stacking rules (`tintype_jobs::STACKS_VERSION`) last applied.
 const STACKS_SETTING: &str = "stacks.version";
 
@@ -444,6 +455,10 @@ impl Engine {
                 self.scan(&roots, hash, events).map(Response::Scan)
             }
             Command::Search { query, smart, sort, limit, offset, stacks } => {
+                if let (Some(photo), filters) = tintype_index::split_like(&query) {
+                    let ordered = self.similar_ranked(photo, &filters)?;
+                    return self.page(ordered, stacks, limit, offset).map(Response::Search);
+                }
                 let smart = smart && !tintype_index::split_smart(&query).1.is_empty();
                 let by_taste = !smart && sort == Sort::Best && self.taste_model()?.is_some();
                 if !smart && !stacks && !by_taste {
@@ -458,7 +473,9 @@ impl Engine {
                 };
                 self.page(ordered, stacks, limit, offset).map(Response::Search)
             }
+            // Over the photos `like:` chooses from, as smart search does.
             Command::Facets { field, query, parent } => {
+                let query = tintype_index::split_like(&query).1;
                 Ok(Response::Facets { counts: self.index.facets(&query, &field, &parent)? })
             }
             // No sidecar check here: on a busy network share it would hold up
@@ -837,6 +854,18 @@ impl Engine {
         Ok(scored.into_iter().map(|(_, id)| id).collect())
     }
 
+    /// Photos matching `query` that look like `photo` (itself first), most alike first.
+    fn similar_ranked(&mut self, photo: i64, query: &str) -> Result<Vec<i64>> {
+        let target = self.catalog.embedding(photo)?.ok_or(Error::NotAnalyzed(photo))?;
+        let allowed = self.index.matching_ids(query)?;
+        if self.embeddings.is_none() {
+            self.embeddings = Some(self.catalog.embeddings()?);
+        }
+        let scored =
+            rank(self.embeddings.as_deref().unwrap_or_default(), &allowed, &target, SIMILAR_MIN, f32::INFINITY);
+        Ok(scored.into_iter().take(SIMILAR_LIMIT).map(|(_, id)| id).collect())
+    }
+
     /// One page of `ordered` results, stacked if asked.
     fn page(&mut self, ordered: Vec<i64>, stacks: bool, limit: usize, offset: usize) -> Result<SearchResults> {
         let entries = if stacks {
@@ -1119,6 +1148,47 @@ mod tests {
         );
         let ranked = rank(&embs, &[1, 2, 3], &[0.8, 0.6], 0.0, 0.2);
         assert_eq!(ranked.len(), 2, "3 (0.6) is more than 0.2 behind the best (0.96)");
+    }
+
+    #[test]
+    fn like_ranks_photos_that_look_alike() {
+        let photos = tempfile::tempdir().unwrap();
+        let names = ["a.jpg", "b.jpg", "c.jpg", "d.jpg"];
+        for n in names {
+            JpegSpec { taken: None, ..JpegSpec::canon() }.write(&photos.path().join(n));
+        }
+        let lib = tempfile::tempdir().unwrap();
+        let mut engine = Engine::open(lib.path()).unwrap();
+        engine
+            .execute(Command::Scan { roots: vec![photos.path().into()], hash: false, kinds: None }, &mut |_| {})
+            .unwrap();
+        let ids: Vec<i64> = names
+            .iter()
+            .map(|n| {
+                let p = tintype_jobs::normalize_path(&photos.path().join(n)).unwrap();
+                engine.catalog.get_by_path(&p.display().to_string()).unwrap().unwrap().id
+            })
+            .collect();
+        // a and b nearly the same, c a little like them, d not analyzed.
+        for (&pid, v) in ids.iter().zip([[1.0, 0.0], [0.99, 0.14], [0.8, 0.6]]) {
+            engine.catalog.set_embedding(pid, Some(&v), ANALYSIS_VERSION).unwrap();
+        }
+        engine.embeddings = None;
+        engine.execute(Command::Rate { photo: PhotoRef::Id(ids[2]), rating: Some(5) }, &mut |_| {}).unwrap();
+
+        let like = |engine: &mut Engine, query: String| {
+            let cmd = Command::Search { query, smart: false, stacks: false, sort: Sort::Newest, limit: 50, offset: 0 };
+            engine.execute(cmd, &mut |_| {}).map(|r| match r {
+                Response::Search(r) => r.hits.iter().map(|h| h.id).collect::<Vec<_>>(),
+                _ => panic!(),
+            })
+        };
+        assert_eq!(like(&mut engine, format!("like:{}", ids[1])).unwrap(), [ids[1], ids[0], ids[2]]);
+        assert_eq!(like(&mut engine, format!("rating:5 like:{}", ids[0])).unwrap(), [ids[2]], "other terms filter");
+        assert!(matches!(like(&mut engine, format!("like:{}", ids[3])), Err(Error::NotAnalyzed(_))));
+        let facets = Command::Facets { field: "ext".into(), query: format!("like:{}", ids[0]), parent: "/".into() };
+        let Response::Facets { counts } = engine.execute(facets, &mut |_| {}).unwrap() else { panic!() };
+        assert_eq!(counts[0].count, 4, "facets count what like: chooses from");
     }
 
     #[test]

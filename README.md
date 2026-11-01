@@ -56,6 +56,9 @@ its own. Tintype reads photos where they are and never changes, moves or deletes
   or subject to see every photo with it; × removes a tag
 - **Open** the photo in your default app (Ctrl+O), or **Print…** it with the Windows
   print dialog (Ctrl+P; on macOS and Linux, open it and print from the viewer)
+- **Similar** shows the photos that look most like the selected one, from anywhere in
+  the library, most alike first (`like:<photo id>` in a search; analyzed photos only).
+  The sidebar's filters narrow them, e.g. to one year
 - **Rescan** to pick up new, changed and removed files in all your folders
 - a **People** tab: Tintype finds faces, groups the ones that look alike, and
   you name a group once. New faces that match a named person are suggested for
@@ -198,6 +201,7 @@ All terms must match.
 | `person:ada` `faces:>=3`       | people (named faces) and number of faces    |
 | `gps:true`                     | photos with a location                      |
 | `stack:12`                     | every photo of one stack                    |
+| `like:12`                      | the 150 photos that look most like photo 12, most alike first |
 | `aesthetic:>=6`                | aesthetic score (when turned on; most photos score 4-7) |
 | `camera:"/FUJIFILM/X-T5"` `ext:/raf` `folder:"/C:/Users/me/Pictures/2024"` | facets |
 
@@ -288,8 +292,8 @@ a screenshot and exits. `TINTYPE_SCREENSHOT_SELECT=<n>` selects a result first,
 3. ~~Faces: detect, group, name, suggest, merge~~
    Next: faster face passes, HEIC/DNG previews for detection, scaling grouping past ~20k faces
 4. ~~Smart search (SigLIP embeddings)~~, ~~stacks of duplicates, versions and bursts~~,
-   ~~aesthetic score, learned taste~~, ~~auto tags (subjects)~~
-   Next: a review list for culling, near-duplicate finder
+   ~~aesthetic score, learned taste~~, ~~auto tags (subjects)~~, ~~similar photos~~
+   Next: a review list for culling (groups of lookalikes taken apart in time)
 5. ~~Installers for Windows, macOS and Linux from CI; app icon~~
    Next: code signing (Apple notarization, Windows signing), auto-update
 6. ~~Read and write PhotoStat XMP sidecars~~

@@ -113,7 +113,8 @@ pub struct ScreenshotPlan {
     pub path: PathBuf,
     /// Select this result index once results arrive.
     pub select: Option<usize>,
-    /// "loupe", "slideshow" (or "slideshow-keys", "slideshow-tags"), "stack", "people" or "person" (the first person's page).
+    /// "loupe", "slideshow" (or "slideshow-keys", "slideshow-tags"), "stack", "similar" (photos like the
+    /// selected one), "people" or "person" (the first person's page).
     pub view: Option<String>,
     /// Run this smart search first (an empty string shows smart mode with no query).
     pub smart_query: Option<String>,
@@ -140,6 +141,8 @@ pub struct TintypeApp {
     pending_open: Option<i64>,
     /// The stack being shown in full: (stack id, photos in it).
     open_stack: Option<(i64, u32)>,
+    /// Showing photos that look like this one: (photo id, file name).
+    similar_to: Option<(i64, String)>,
     /// A folder picked to add, waiting for the user to choose its file kinds.
     adding_folder: Option<PathBuf>,
     /// The full-screen slideshow, while it runs.
@@ -201,6 +204,7 @@ impl TintypeApp {
             smart: SmartState::default(),
             pending_open: None,
             open_stack: None,
+            similar_to: None,
             adding_folder: None,
             slideshow: None,
             query: String::new(),
@@ -261,7 +265,22 @@ impl TintypeApp {
         if let Some((stack, _)) = self.open_stack {
             q.push_str(&format!(" stack:{stack}"));
         }
+        if let Some((photo, _)) = &self.similar_to {
+            q.push_str(&format!(" like:{photo}"));
+        }
         q
+    }
+
+    /// Shows the photos in the library that look like `photo`, most alike
+    /// first (`None`: back to the search). Filters added afterwards narrow them.
+    fn show_similar(&mut self, photo: Option<(i64, String)>) {
+        if photo.is_some() {
+            self.query.clear();
+            self.filters.clear();
+            self.open_stack = None;
+        }
+        self.similar_to = photo;
+        self.show_new_results();
     }
 
     /// Shows every photo of a stack (`None`: back to one photo per stack).
@@ -659,40 +678,6 @@ impl TintypeApp {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| self.library_buttons(ui));
                 return;
             }
-            let search_width = (ui.available_width() - 550.0).max(220.0);
-            let hint = if self.settings.smart {
-                "Describe it: dog on a beach   red car at night   year:2024"
-            } else {
-                "Search: beach   make:fujifilm   iso:>1600   year:2024   rating:>=4"
-            };
-            let resp = ui.add(
-                TextEdit::singleline(&mut self.query)
-                    .id_salt("tintype-search")
-                    .hint_text(hint)
-                    .desired_width(search_width),
-            );
-            self.search_box = Some(resp.id);
-            if resp.changed() {
-                self.search_due = Some(Instant::now() + TYPING_DEBOUNCE);
-            }
-            if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                self.show_new_results();
-            }
-            if !self.query.is_empty() && ui.small_button("×").on_hover_text("Clear search").clicked() {
-                self.query.clear();
-                self.show_new_results();
-            }
-            if ui
-                .toggle_value(&mut self.settings.smart, "Smart")
-                .on_hover_text(
-                    "Find photos by what they show: \"dog on a beach\", \"red car at night\".\n\
-                     Field terms like year:2024 or rating:>=4 still filter. Best matches come first.",
-                )
-                .changed()
-            {
-                self.show_new_results();
-            }
-
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 self.library_buttons(ui);
                 if ui
@@ -706,8 +691,15 @@ impl TintypeApp {
                 ui.add(egui::Slider::new(&mut self.settings.thumb_size, 96.0..=320.0).show_value(false))
                     .on_hover_text("Thumbnail size");
                 let before = self.settings.sort;
-                ui.add_enabled_ui(!self.settings.smart, |ui| {
-                    let label = if self.settings.smart { "Best match" } else { sort_label(self.settings.sort) };
+                let ranked = self.settings.smart || self.similar_to.is_some();
+                ui.add_enabled_ui(!ranked, |ui| {
+                    let label = if self.similar_to.is_some() {
+                        "Most alike"
+                    } else if self.settings.smart {
+                        "Best match"
+                    } else {
+                        sort_label(self.settings.sort)
+                    };
                     egui::ComboBox::from_id_salt("sort").selected_text(label).show_ui(ui, |ui| {
                         for s in [Sort::Newest, Sort::Oldest, Sort::Relevance, Sort::Best] {
                             let resp = ui.selectable_value(&mut self.settings.sort, s, sort_label(s));
@@ -718,10 +710,48 @@ impl TintypeApp {
                     });
                 })
                 .response
-                .on_disabled_hover_text("Smart search shows the best matches first");
+                .on_disabled_hover_text("Smart search and similar photos show the best matches first");
                 if self.settings.sort != before {
                     self.search();
                 }
+                // Placed after the buttons on the right, so it never runs under them.
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    // The space the buttons on the right leave, less the clear button and Smart toggle.
+                    let others = if self.query.is_empty() { 75.0 } else { 105.0 };
+                    let search_width = (ui.available_width() - others).max(160.0);
+                    let hint = if self.settings.smart {
+                        "Describe it: dog on a beach   red car at night   year:2024"
+                    } else {
+                        "Search: beach   make:fujifilm   iso:>1600   year:2024   rating:>=4"
+                    };
+                    let resp = ui.add(
+                        TextEdit::singleline(&mut self.query)
+                            .id_salt("tintype-search")
+                            .hint_text(hint)
+                            .desired_width(search_width),
+                    );
+                    self.search_box = Some(resp.id);
+                    if resp.changed() {
+                        self.search_due = Some(Instant::now() + TYPING_DEBOUNCE);
+                    }
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                        self.show_new_results();
+                    }
+                    if !self.query.is_empty() && ui.small_button("×").on_hover_text("Clear search").clicked() {
+                        self.query.clear();
+                        self.show_new_results();
+                    }
+                    if ui
+                        .toggle_value(&mut self.settings.smart, "Smart")
+                        .on_hover_text(
+                            "Find photos by what they show: \"dog on a beach\", \"red car at night\".\n\
+                             Field terms like year:2024 or rating:>=4 still filter. Best matches come first.",
+                        )
+                        .changed()
+                    {
+                        self.show_new_results();
+                    }
+                });
             });
         });
 
@@ -733,6 +763,19 @@ impl TintypeApp {
             ui.colored_label(ui.visuals().error_fg_color, err);
         }
         self.smart_banner(ui);
+        if let Some((_, name)) = &self.similar_to {
+            let mut close = false;
+            ui.horizontal(|ui| {
+                ui.weak("Showing");
+                close = ui
+                    .button(format!("Photos like {name}  ×"))
+                    .on_hover_text("Most alike first. Back to the search")
+                    .clicked();
+            });
+            if close {
+                self.show_similar(None);
+            }
+        }
         if let Some((_, n)) = self.open_stack {
             let mut close = false;
             ui.horizontal(|ui| {
@@ -920,6 +963,7 @@ impl TintypeApp {
         let mut open_stack = None;
         let mut show_subject = None;
         let mut show_tag = None;
+        let mut show_similar = false;
         // Some(true): print the photo; Some(false): open it in the default app.
         let mut hand_over = None;
 
@@ -944,6 +988,10 @@ impl TintypeApp {
                 {
                     hand_over = Some(true);
                 }
+                show_similar = ui
+                    .small_button("Similar")
+                    .on_hover_text("Show photos that look like this one, most alike first")
+                    .clicked();
             });
             let hit = self.selected.and_then(|i| self.results.get(i)).filter(|h| h.id == p.id);
             if let Some((stack, n)) = hit.and_then(|h| h.stack.map(|s| (s, h.stack_size))).filter(|(_, n)| *n > 1) {
@@ -1078,6 +1126,10 @@ impl TintypeApp {
         }
         if let Some(print) = hand_over {
             self.hand_to_os(&p.path, print);
+        }
+        if show_similar {
+            let name = Path::new(&p.path).file_name().map_or(p.path.clone(), |n| n.to_string_lossy().into_owned());
+            self.show_similar(Some((p.id, name)));
         }
         if let Some(r) = new_rating {
             self.rate(p.id, r);
@@ -1300,6 +1352,19 @@ impl TintypeApp {
                             s.plan.view = None;
                         }
                         self.open_stack(Some((stack, n)));
+                    }
+                }
+                // Photos like the selected one (TINTYPE_SCREENSHOT_SELECT).
+                Some("similar") => {
+                    if let Some(h) = self.selected.and_then(|i| self.results.get(i)) {
+                        let photo = (h.id, Path::new(&h.path).file_name().unwrap().to_string_lossy().into_owned());
+                        self.searched_once = false;
+                        if let Some(s) = &mut self.screenshot {
+                            s.selected = false;
+                            s.plan.view = None;
+                            s.plan.select = Some(0);
+                        }
+                        self.show_similar(Some(photo));
                     }
                 }
                 Some("people" | "person") => {
