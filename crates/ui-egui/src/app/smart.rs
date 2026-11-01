@@ -102,7 +102,7 @@ impl TintypeApp {
             (Job::Analyze, Ok(Response::Analyze(r))) => {
                 let Some(a) = &mut self.smart.analyzing else { return true };
                 a.done += r.processed;
-                if r.cancelled || a.stop || r.remaining == 0 || r.processed == 0 {
+                if r.cancelled || a.stop || r.remaining == 0 || (r.processed == 0 && !r.paused) {
                     let (status, _) = a.status(a.done);
                     // Stuck: don't start again by itself.
                     self.smart.held |= r.remaining > 0;

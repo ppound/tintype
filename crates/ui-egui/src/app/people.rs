@@ -219,7 +219,7 @@ impl TintypeApp {
                 let Some(f) = &mut self.people.finding else { return true };
                 f.done += r.processed;
                 f.faces += r.faces;
-                let finished = r.cancelled || f.stop || r.remaining == 0 || r.processed == 0;
+                let finished = r.cancelled || f.stop || r.remaining == 0 || (r.processed == 0 && !r.paused);
                 if finished {
                     let (done, faces) = (f.done, f.faces);
                     self.people.finding = None;

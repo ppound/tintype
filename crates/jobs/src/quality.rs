@@ -2,13 +2,15 @@
 //! aesthetic score, for photos that don't have them yet.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use rayon::prelude::*;
 use serde::Serialize;
 use tintype_analyze::{AESTHETIC_VERSION, AestheticScorer, QUALITY_EDGE, SHARPNESS_VERSION};
 use tintype_catalog::Catalog;
+
+use crate::Stop;
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct QualityReport {
@@ -18,6 +20,8 @@ pub struct QualityReport {
     /// Photos still waiting for a quality pass.
     pub remaining: u64,
     pub cancelled: bool,
+    /// Stopped early because other work was waiting; carry on with another batch.
+    pub paused: bool,
     pub elapsed_ms: u64,
 }
 
@@ -26,7 +30,7 @@ pub fn measure_quality(
     catalog: &mut Catalog,
     scorer: Option<&AestheticScorer>,
     limit: usize,
-    cancel: &AtomicBool,
+    stop: Stop,
     progress: &mut dyn FnMut(u64, u64),
 ) -> Result<QualityReport, tintype_catalog::Error> {
     let started = Instant::now();
@@ -41,27 +45,29 @@ pub fn measure_quality(
     std::thread::scope(|scope| {
         let todo = &todo;
         scope.spawn(move || {
-            todo.par_iter().for_each_with(tx, |tx, t| {
-                if cancel.load(Ordering::Relaxed) {
-                    return;
-                }
-                let measured = crate::guarded(|| {
-                    let img = tintype_codecs::decode_preview(Path::new(&t.path), QUALITY_EDGE).ok();
-                    let sharp = t
-                        .sharpness
-                        .then(|| (img.as_ref().and_then(|i| tintype_analyze::sharpness(i).ok()), SHARPNESS_VERSION));
-                    let aes = match (t.aesthetic, scorer) {
-                        (true, Some(s)) => Some((img.as_ref().and_then(|i| s.score(i).ok()), AESTHETIC_VERSION)),
-                        _ => None,
-                    };
-                    Some((sharp, aes, img.is_none()))
-                });
-                // A photo that crashed the decoder is recorded as measured, without values.
-                let (sharp, aes, failed) = measured.unwrap_or_else(|| {
-                    let aes = (t.aesthetic && scorer.is_some()).then_some((None, AESTHETIC_VERSION));
-                    (t.sharpness.then_some((None, SHARPNESS_VERSION)), aes, true)
-                });
-                let _ = tx.send((t.id, sharp, aes, failed));
+            crate::pool().install(|| {
+                todo.par_iter().for_each_with(tx, |tx, t| {
+                    if stop.requested() {
+                        return;
+                    }
+                    let measured = crate::guarded(|| {
+                        let img = tintype_codecs::decode_preview(Path::new(&t.path), QUALITY_EDGE).ok();
+                        let sharp = t.sharpness.then(|| {
+                            (img.as_ref().and_then(|i| tintype_analyze::sharpness(i).ok()), SHARPNESS_VERSION)
+                        });
+                        let aes = match (t.aesthetic, scorer) {
+                            (true, Some(s)) => Some((img.as_ref().and_then(|i| s.score(i).ok()), AESTHETIC_VERSION)),
+                            _ => None,
+                        };
+                        Some((sharp, aes, img.is_none()))
+                    });
+                    // A photo that crashed the decoder is recorded as measured, without values.
+                    let (sharp, aes, failed) = measured.unwrap_or_else(|| {
+                        let aes = (t.aesthetic && scorer.is_some()).then_some((None, AESTHETIC_VERSION));
+                        (t.sharpness.then_some((None, SHARPNESS_VERSION)), aes, true)
+                    });
+                    let _ = tx.send((t.id, sharp, aes, failed));
+                })
             });
         });
         for (id, sharp, aes, failed) in rx {
@@ -73,7 +79,7 @@ pub fn measure_quality(
                 Ok(()) => report.processed += 1,
                 Err(e) => {
                     write_error = Some(e);
-                    cancel.store(true, Ordering::Relaxed);
+                    stop.cancel.store(true, Ordering::Relaxed);
                 }
             }
             progress(report.processed, total);
@@ -82,7 +88,8 @@ pub fn measure_quality(
     if let Some(e) = write_error {
         return Err(e);
     }
-    report.cancelled = cancel.load(Ordering::Relaxed) && report.processed < total;
+    report.cancelled = stop.cancelled() && report.processed < total;
+    report.paused = !report.cancelled && stop.paused() && report.processed < total;
     report.remaining = catalog.count_needing_quality(SHARPNESS_VERSION, aesthetic_version)?;
     report.elapsed_ms = started.elapsed().as_millis() as u64;
     Ok(report)
@@ -90,6 +97,8 @@ pub fn measure_quality(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicBool;
+
     use super::*;
 
     #[test]
@@ -102,9 +111,22 @@ mod tests {
         std::fs::write(dir.path().join("broken.jpg"), b"not a jpeg").unwrap();
         let mut cat = Catalog::open_in_memory().unwrap();
         crate::scan(&mut cat, &[dir.path().into()], &Default::default(), &AtomicBool::new(false), &mut |_| {}).unwrap();
-        let r = measure_quality(&mut cat, None, 10, &AtomicBool::new(false), &mut |_, _| {}).unwrap();
+        let (cancel, pause) = (AtomicBool::new(false), AtomicBool::new(false));
+        let stop = Stop { cancel: &cancel, pause: &pause };
+        let r = measure_quality(&mut cat, None, 10, stop, &mut |_, _| {}).unwrap();
         assert_eq!((r.processed, r.failed, r.remaining), (2, 1, 0));
-        let again = measure_quality(&mut cat, None, 10, &AtomicBool::new(false), &mut |_, _| {}).unwrap();
+        let again = measure_quality(&mut cat, None, 10, stop, &mut |_, _| {}).unwrap();
         assert_eq!(again.processed, 0, "nothing left to measure");
+    }
+
+    #[test]
+    fn a_waiting_command_pauses_the_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        image::RgbImage::new(8, 8).save(dir.path().join("a.jpg")).unwrap();
+        let mut cat = Catalog::open_in_memory().unwrap();
+        crate::scan(&mut cat, &[dir.path().into()], &Default::default(), &AtomicBool::new(false), &mut |_| {}).unwrap();
+        let (cancel, pause) = (AtomicBool::new(false), AtomicBool::new(true));
+        let r = measure_quality(&mut cat, None, 10, Stop { cancel: &cancel, pause: &pause }, &mut |_, _| {}).unwrap();
+        assert_eq!((r.processed, r.paused, r.cancelled, r.remaining), (0, true, false, 1));
     }
 }

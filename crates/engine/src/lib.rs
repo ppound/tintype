@@ -331,6 +331,9 @@ pub struct Engine {
     index: PhotoIndex,
     thumbs: Arc<ThumbCache>,
     cancel: Arc<AtomicBool>,
+    /// Set by the caller while other commands are waiting: a running batch
+    /// ends early so the waiting command (a click in the UI) runs soon.
+    pause: Arc<AtomicBool>,
     models: ModelStore,
     analyzer: Option<Arc<FaceAnalyzer>>,
     batches_since_recognize: u32,
@@ -362,6 +365,7 @@ impl Engine {
             index,
             thumbs,
             cancel: Arc::default(),
+            pause: Arc::default(),
             models: ModelStore::new(models_dir(dir)),
             analyzer: None,
             batches_since_recognize: 0,
@@ -411,6 +415,10 @@ impl Engine {
     /// Set this flag from another thread to stop the running command early.
     pub fn cancel_flag(&self) -> Arc<AtomicBool> {
         self.cancel.clone()
+    }
+
+    pub fn pause_flag(&self) -> Arc<AtomicBool> {
+        self.pause.clone()
     }
 
     pub fn execute(&mut self, cmd: Command, events: &mut dyn FnMut(Event)) -> Result<Response> {
@@ -684,7 +692,8 @@ impl Engine {
         let mut report = if self.catalog.count_needing_analysis(ANALYSIS_VERSION)? > 0 {
             let encoder = self.image_encoder(events)?;
             let mut progress = |done, total| events(Event::Analyze { done, total });
-            let r = tintype_jobs::analyze(&mut self.catalog, &encoder, batch.max(1), &self.cancel, &mut progress)?;
+            let stop = tintype_jobs::Stop { cancel: &self.cancel, pause: &self.pause };
+            let r = tintype_jobs::analyze(&mut self.catalog, &encoder, batch.max(1), stop, &mut progress)?;
             if r.processed > 0 {
                 self.embeddings = None;
                 self.taste = None;
@@ -708,7 +717,7 @@ impl Engine {
                 &mut self.catalog,
                 scorer.as_deref(),
                 batch.max(1),
-                &self.cancel,
+                tintype_jobs::Stop { cancel: &self.cancel, pause: &self.pause },
                 &mut progress,
             )?;
             if q.processed > 0 && scorer.is_some() {
@@ -721,6 +730,7 @@ impl Engine {
                 failed: q.failed,
                 remaining: q.remaining,
                 cancelled: q.cancelled,
+                paused: q.paused,
                 elapsed_ms: q.elapsed_ms,
             }
         };
@@ -861,8 +871,9 @@ impl Engine {
         let analyzer = self.analyzer(events)?;
         let crops = self.faces_dir();
         let mut progress = |done, total| events(Event::Faces { done, total });
+        let stop = tintype_jobs::Stop { cancel: &self.cancel, pause: &self.pause };
         let mut report =
-            tintype_jobs::find_faces(&mut self.catalog, &analyzer, &crops, batch.max(1), &self.cancel, &mut progress)?;
+            tintype_jobs::find_faces(&mut self.catalog, &analyzer, &crops, batch.max(1), stop, &mut progress)?;
         let mut changed = std::mem::take(&mut report.changed_photos);
         // Matching looks at every face, so during a long scan it runs every few batches, and at the end.
         self.batches_since_recognize += 1;

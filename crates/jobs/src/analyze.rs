@@ -1,13 +1,15 @@
 //! Analysis passes: embed photos not yet analyzed, for semantic search.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use rayon::prelude::*;
 use serde::Serialize;
 use tintype_analyze::{ANALYSIS_EDGE, ANALYSIS_VERSION, ImageEncoder};
 use tintype_catalog::Catalog;
+
+use crate::Stop;
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct AnalyzeReport {
@@ -18,6 +20,8 @@ pub struct AnalyzeReport {
     /// Photos still waiting for analysis.
     pub remaining: u64,
     pub cancelled: bool,
+    /// Stopped early because other work was waiting; carry on with another batch.
+    pub paused: bool,
     pub elapsed_ms: u64,
 }
 
@@ -26,7 +30,7 @@ pub fn analyze(
     catalog: &mut Catalog,
     encoder: &ImageEncoder,
     limit: usize,
-    cancel: &AtomicBool,
+    stop: Stop,
     progress: &mut dyn FnMut(u64, u64),
 ) -> Result<AnalyzeReport, tintype_catalog::Error> {
     let started = Instant::now();
@@ -40,16 +44,18 @@ pub fn analyze(
     std::thread::scope(|scope| {
         let photos = &photos;
         scope.spawn(move || {
-            photos.par_iter().for_each_with(tx, |tx, (id, path)| {
-                if cancel.load(Ordering::Relaxed) {
-                    return;
-                }
-                let embedding = crate::guarded(|| {
-                    tintype_codecs::decode_preview(Path::new(path), ANALYSIS_EDGE)
-                        .ok()
-                        .and_then(|img| encoder.embed(&img).ok())
-                });
-                let _ = tx.send((*id, embedding));
+            crate::pool().install(|| {
+                photos.par_iter().for_each_with(tx, |tx, (id, path)| {
+                    if stop.requested() {
+                        return;
+                    }
+                    let embedding = crate::guarded(|| {
+                        tintype_codecs::decode_preview(Path::new(path), ANALYSIS_EDGE)
+                            .ok()
+                            .and_then(|img| encoder.embed(&img).ok())
+                    });
+                    let _ = tx.send((*id, embedding));
+                })
             });
         });
         for (photo, embedding) in rx {
@@ -61,7 +67,7 @@ pub fn analyze(
                 Ok(()) => report.processed += 1,
                 Err(e) => {
                     write_error = Some(e);
-                    cancel.store(true, Ordering::Relaxed);
+                    stop.cancel.store(true, Ordering::Relaxed);
                 }
             }
             progress(report.processed, total);
@@ -70,7 +76,8 @@ pub fn analyze(
     if let Some(e) = write_error {
         return Err(e);
     }
-    report.cancelled = cancel.load(Ordering::Relaxed) && report.processed < total;
+    report.cancelled = stop.cancelled() && report.processed < total;
+    report.paused = !report.cancelled && stop.paused() && report.processed < total;
     report.remaining = catalog.count_needing_analysis(ANALYSIS_VERSION)?;
     report.elapsed_ms = started.elapsed().as_millis() as u64;
     Ok(report)

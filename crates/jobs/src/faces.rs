@@ -3,13 +3,15 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use rayon::prelude::*;
 use serde::Serialize;
 use tintype_catalog::{Catalog, NewFace, Suggestion};
 use tintype_faces::{FACES_VERSION, Face, FaceAnalyzer};
+
+use crate::Stop;
 
 /// An unconfirmed face is suggested as a person when it matches their
 /// confirmed faces this well (mean of its best `MATCH_K` similarities)...
@@ -42,6 +44,8 @@ pub struct FacesReport {
     /// Photos still waiting for a face pass.
     pub remaining: u64,
     pub cancelled: bool,
+    /// Stopped early because other work was waiting; carry on with another batch.
+    pub paused: bool,
     pub elapsed_ms: u64,
     /// Photos whose faces changed; the caller reindexes these.
     #[serde(skip)]
@@ -59,7 +63,7 @@ pub fn find_faces(
     analyzer: &FaceAnalyzer,
     crops: &Path,
     limit: usize,
-    cancel: &AtomicBool,
+    stop: Stop,
     progress: &mut dyn FnMut(u64, u64),
 ) -> Result<FacesReport, Error> {
     let started = Instant::now();
@@ -74,16 +78,18 @@ pub fn find_faces(
     std::thread::scope(|scope| {
         let photos = &photos;
         scope.spawn(move || {
-            photos.par_iter().for_each_with(tx, |tx, (id, path)| {
-                if cancel.load(Ordering::Relaxed) {
-                    return;
-                }
-                let faces = crate::guarded(|| {
-                    tintype_codecs::decode_preview(Path::new(path), tintype_faces::ANALYSIS_EDGE)
-                        .ok()
-                        .and_then(|img| analyzer.analyze(&img).ok())
-                });
-                let _ = tx.send((*id, faces));
+            crate::pool().install(|| {
+                photos.par_iter().for_each_with(tx, |tx, (id, path)| {
+                    if stop.requested() {
+                        return;
+                    }
+                    let faces = crate::guarded(|| {
+                        tintype_codecs::decode_preview(Path::new(path), tintype_faces::ANALYSIS_EDGE)
+                            .ok()
+                            .and_then(|img| analyzer.analyze(&img).ok())
+                    });
+                    let _ = tx.send((*id, faces));
+                })
             });
         });
         for (photo, faces) in rx {
@@ -92,7 +98,7 @@ pub fn find_faces(
             }
             if let Err(e) = store_faces(catalog, crops, photo, faces, &mut report) {
                 write_error = Some(e);
-                cancel.store(true, Ordering::Relaxed);
+                stop.cancel.store(true, Ordering::Relaxed);
             }
             progress(report.processed, total);
         }
@@ -100,7 +106,8 @@ pub fn find_faces(
     if let Some(e) = write_error {
         return Err(e);
     }
-    report.cancelled = cancel.load(Ordering::Relaxed) && report.processed < total;
+    report.cancelled = stop.cancelled() && report.processed < total;
+    report.paused = !report.cancelled && stop.paused() && report.processed < total;
 
     report.remaining = catalog.count_needing_faces(FACES_VERSION)?;
     report.elapsed_ms = started.elapsed().as_millis() as u64;

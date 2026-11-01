@@ -891,6 +891,7 @@ impl TintypeApp {
         let mut remove_tag = None;
         let mut open_stack = None;
         let mut show_subject = None;
+        let mut show_tag = None;
 
         ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
             ui.add_space(8.0);
@@ -975,9 +976,16 @@ impl TintypeApp {
             if !p.tags.is_empty() {
                 ui.horizontal_wrapped(|ui| {
                     for t in &p.tags {
-                        if ui.button(format!("{t}  ×")).on_hover_text("Remove tag").clicked() {
-                            remove_tag = Some(t.clone());
-                        }
+                        // The name filters by the tag; × removes it from this photo.
+                        egui::Frame::group(ui.style()).inner_margin(egui::Margin::symmetric(6, 2)).show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            if ui.link(t).on_hover_text(format!("Show every photo tagged {t}")).clicked() {
+                                show_tag = Some(facet_path(&[t]));
+                            }
+                            if ui.small_button("×").on_hover_text("Remove tag from this photo").clicked() {
+                                remove_tag = Some(t.clone());
+                            }
+                        });
                     }
                 });
             }
@@ -1026,6 +1034,9 @@ impl TintypeApp {
         }
         if let Some(path) = show_subject {
             self.set_filter("subjects", Some(path));
+        }
+        if let Some(path) = show_tag {
+            self.set_filter("tags", Some(path));
         }
         if let Some(r) = new_rating {
             self.rate(p.id, r);
