@@ -976,16 +976,13 @@ impl TintypeApp {
             if !p.tags.is_empty() {
                 ui.horizontal_wrapped(|ui| {
                     for t in &p.tags {
-                        // The name filters by the tag; × removes it from this photo.
-                        egui::Frame::group(ui.style()).inner_margin(egui::Margin::symmetric(6, 2)).show(ui, |ui| {
-                            ui.spacing_mut().item_spacing.x = 4.0;
-                            if ui.link(t).on_hover_text(format!("Show every photo tagged {t}")).clicked() {
-                                show_tag = Some(facet_path(&[t]));
-                            }
-                            if ui.small_button("×").on_hover_text("Remove tag from this photo").clicked() {
-                                remove_tag = Some(t.clone());
-                            }
-                        });
+                        let (name, close) = tag_chip(ui, t);
+                        if name.on_hover_text(format!("Show every photo tagged {t}")).clicked() {
+                            show_tag = Some(facet_path(&[t]));
+                        }
+                        if close.on_hover_text("Remove tag from this photo").clicked() {
+                            remove_tag = Some(t.clone());
+                        }
                     }
                 });
             }
@@ -1444,6 +1441,51 @@ fn fit(size: Vec2, bounds: Rect) -> Rect {
 
 /// One clickable facet value: label on the left (clipped, full text on hover),
 /// count on the right.
+/// A tag in the details panel: its name (a link) and × to remove it. One
+/// widget, so a row of them wraps; a long name is cut to the panel's width
+/// (its tooltip has it in full).
+fn tag_chip(ui: &mut egui::Ui, tag: &str) -> (egui::Response, egui::Response) {
+    let (pad, gap) = (vec2(7.0, 3.0), 6.0);
+    let font = FontId::proportional(ui.text_style_height(&egui::TextStyle::Body));
+    let visuals = ui.visuals().clone();
+    let close = ui.painter().layout_no_wrap("×".into(), font.clone(), visuals.text_color());
+    let name = ui.painter().layout_no_wrap(tag.to_string(), font, visuals.hyperlink_color);
+    let close_w = close.size().x + 2.0 * pad.x;
+    let max_name = (ui.max_rect().width() - close_w - pad.x - gap).max(20.0);
+    let name_w = name.size().x.min(max_name);
+    let size = vec2(pad.x + name_w + gap / 2.0 + close_w, name.size().y + 2.0 * pad.y);
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    let split = rect.left() + pad.x + name_w + gap / 2.0;
+    let name_rect = Rect::from_min_max(rect.min, pos2(split, rect.max.y));
+    let close_rect = Rect::from_min_max(pos2(split, rect.min.y), rect.max);
+    let name_resp = ui.interact(name_rect, ui.scope_id().with(("tag", tag)), Sense::click());
+    let close_resp = ui.interact(close_rect, ui.scope_id().with(("untag", tag)), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        painter.rect(
+            rect,
+            4.0,
+            visuals.widgets.inactive.weak_bg_fill,
+            visuals.widgets.noninteractive.bg_stroke,
+            egui::StrokeKind::Inside,
+        );
+        if close_resp.hovered() {
+            painter.rect_filled(close_rect.shrink(2.0), 3.0, visuals.widgets.hovered.bg_fill);
+        }
+        let text_rect = Rect::from_min_size(rect.min + pad, vec2(name_w, name.size().y));
+        if name_resp.hovered() {
+            let y = text_rect.bottom() - 1.0;
+            painter.hline(text_rect.x_range(), y, egui::Stroke::new(1.0, visuals.hyperlink_color));
+        }
+        painter.with_clip_rect(text_rect).galley(text_rect.min, name, visuals.hyperlink_color);
+        painter.galley(close_rect.center() - close.size() / 2.0, close, visuals.text_color());
+    }
+    (
+        name_resp.on_hover_cursor(egui::CursorIcon::PointingHand),
+        close_resp.on_hover_cursor(egui::CursorIcon::PointingHand),
+    )
+}
+
 fn facet_row(ui: &mut egui::Ui, label: &str, count: u64) -> egui::Response {
     let height = ui.text_style_height(&egui::TextStyle::Body) + 6.0;
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click());
