@@ -4921,7 +4921,7 @@ dependencies = [
 
 [[package]]
 name = "tintype"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "mimalloc",
  "rfd",
@@ -4931,7 +4931,7 @@ dependencies = [
 
 [[package]]
 name = "tintype-analyze"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "image",
  "thiserror 2.0.21",
@@ -4943,7 +4943,7 @@ dependencies = [
 
 [[package]]
 name = "tintype-catalog"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "rusqlite",
@@ -4956,7 +4956,7 @@ dependencies = [
 
 [[package]]
 name = "tintype-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -4968,7 +4968,7 @@ dependencies = [
 
 [[package]]
 name = "tintype-codecs"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "blake3",
  "image",
@@ -4980,7 +4980,7 @@ dependencies = [
 
 [[package]]
 name = "tintype-engine"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "directories",
  "dunce",
@@ -5002,7 +5002,7 @@ dependencies = [
 
 [[package]]
 name = "tintype-faces"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "image",
  "rayon",
@@ -5013,7 +5013,7 @@ dependencies = [
 
 [[package]]
 name = "tintype-index"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "serde",
@@ -5026,7 +5026,7 @@ dependencies = [
 
 [[package]]
 name = "tintype-infer"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "sha2",
  "tempfile",
@@ -5037,7 +5037,7 @@ dependencies = [
 
 [[package]]
 name = "tintype-jobs"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "blake3",
  "dunce",
@@ -5058,7 +5058,7 @@ dependencies = [
 
 [[package]]
 name = "tintype-meta"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "imagesize",
@@ -5073,14 +5073,14 @@ dependencies = [
 
 [[package]]
 name = "tintype-testkit"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "kamadak-exif",
 ]
 
 [[package]]
 name = "tintype-ui-egui"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "crossbeam-channel",
  "eframe",
@@ -6593,7 +6593,7 @@ checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 
 [[package]]
 name = "xtask"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "serde_json",
