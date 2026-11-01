@@ -14,6 +14,7 @@
 //! | `camera:"/Canon"`           | facet (and everything below it)            |
 //! | `rating:>=4 tag:family`     | the user's own metadata                    |
 //! | `person:alice` `faces:>=3`  | people (named faces) and face count         |
+//! | `subject:dog`               | auto tags (also matched by plain words)    |
 //! | `stack:12`                  | the photos of one stack                    |
 //! | `aesthetic:>=6`             | LAION aesthetic score (when computed)      |
 //! | `gps:true`                  | has location                               |
@@ -33,12 +34,12 @@ use tantivy::{DateTime, DocAddress, Index, IndexReader, IndexWriter, Order, Relo
 use tintype_catalog::PhotoRecord;
 
 /// Bump whenever the schema or the way documents are built changes.
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 const VERSION_FILE: &str = "tintype-schema-version";
 const WRITER_HEAP_BYTES: usize = 128 * 1024 * 1024;
 
 /// Facet fields that [`PhotoIndex::facets`] accepts.
-pub const FACET_FIELDS: &[&str] = &["camera", "lenses", "date", "ext", "tags", "people", "folder"];
+pub const FACET_FIELDS: &[&str] = &["camera", "lenses", "date", "ext", "tags", "subjects", "people", "folder"];
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -104,11 +105,13 @@ struct Fields {
     lens: Field,
     tag: Field,
     person: Field,
+    subject: Field,
     camera: Field,
     lenses: Field,
     date: Field,
     ext: Field,
     tags: Field,
+    subjects: Field,
     people: Field,
     folder: Field,
     taken: Field,
@@ -142,11 +145,13 @@ fn schema() -> (Schema, Fields) {
         lens: b.add_text_field("lens", TEXT),
         tag: b.add_text_field("tag", TEXT),
         person: b.add_text_field("person", TEXT),
+        subject: b.add_text_field("subject", TEXT),
         camera: b.add_facet_field("camera", facet.clone()),
         lenses: b.add_facet_field("lenses", facet.clone()),
         date: b.add_facet_field("date", facet.clone()),
         ext: b.add_facet_field("ext", facet.clone()),
         tags: b.add_facet_field("tags", facet.clone()),
+        subjects: b.add_facet_field("subjects", facet.clone()),
         people: b.add_facet_field("people", facet.clone()),
         folder: b.add_facet_field("folder", facet),
         taken: b.add_date_field("taken", num.clone()),
@@ -421,6 +426,13 @@ impl PhotoIndex {
             doc.add_facet(f.tags, Facet::from_path([tag]));
             text.push(tag);
         }
+        // "Animals/Dog": filtered by group and name, searched by name.
+        for subject in &rec.subjects {
+            let name = subject.rsplit('/').next().unwrap_or(subject);
+            doc.add_text(f.subject, name);
+            doc.add_facet(f.subjects, Facet::from_path(subject.split('/')));
+            text.push(name);
+        }
 
         for name in &rec.people {
             doc.add_text(f.person, name);
@@ -541,6 +553,7 @@ mod tests {
             error: None,
             rating: None,
             tags: Vec::new(),
+            subjects: Vec::new(),
             people: Vec::new(),
             faces: 0,
             stack: None,
@@ -576,6 +589,7 @@ mod tests {
         beach.people = vec!["Ada Lovelace".into()];
         beach.faces = 3;
         beach.tags = vec!["family".into(), "beach".into()];
+        beach.subjects = vec!["Animals/Dog".into(), "Food & drink/Ice cream".into()];
 
         let mut idx = PhotoIndex::in_memory().unwrap();
         idx.upsert(&[
@@ -610,6 +624,9 @@ mod tests {
         assert_eq!(ids(&idx, "lovelace faces:>=2"), vec![2]);
         assert_eq!(ids(&idx, "people:\"/Ada Lovelace\""), vec![2]);
         assert_eq!(ids(&idx, "zoo"), vec![1], "path components are searchable");
+        assert_eq!(ids(&idx, "subject:dog"), vec![2]);
+        assert_eq!(ids(&idx, "dog"), vec![2], "auto tags are searched like words");
+        assert_eq!(ids(&idx, "subject:animals"), Vec::<i64>::new(), "by name, not group");
         assert_eq!(ids(&idx, "camera:\"/Canon\""), vec![1]);
         assert_eq!(ids(&idx, "canon nikon"), Vec::<i64>::new(), "terms are ANDed");
         assert!(matches!(idx.search("iso:>>", Sort::Relevance, 10, 0), Err(Error::Query(_))));
@@ -687,6 +704,9 @@ mod tests {
         assert_eq!(months, vec![FacetCount { path: "/2023/05".into(), count: 1 }]);
         assert_eq!(idx.facets("", "date", "2023").unwrap(), months, "leading slash optional");
         assert!(matches!(idx.facets("", "nope", "/"), Err(Error::UnknownFacet(_))));
+        let food = idx.facets("", "subjects", "/Food & drink").unwrap();
+        assert_eq!(food, vec![FacetCount { path: "/Food & drink/Ice cream".into(), count: 1 }]);
+        assert_eq!(ids(&idx, &facet_filter("subjects", "/Animals")), vec![2]);
     }
 
     #[test]

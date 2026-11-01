@@ -44,17 +44,19 @@ impl Catalog {
         Ok(n as u64)
     }
 
-    /// Photos needing any analysis: embeddings, sharpness, or (when given) the aesthetic score.
+    /// Photos needing any analysis: embeddings, auto tags, sharpness, or (when
+    /// given) the aesthetic score.
     pub fn count_needing_any_analysis(
         &self,
         analysis_version: u32,
+        subjects_version: u32,
         sharpness_version: u32,
         aesthetic_version: Option<u32>,
     ) -> Result<u64> {
         let n: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM photos WHERE analysis_version < ?1 OR sharpness_version < ?2
-                 OR (?3 IS NOT NULL AND aesthetic_version < ?3)",
-            params![analysis_version, sharpness_version, aesthetic_version],
+            "SELECT COUNT(*) FROM photos WHERE analysis_version < ?1 OR subjects_version < ?2
+                 OR sharpness_version < ?3 OR (?4 IS NOT NULL AND aesthetic_version < ?4)",
+            params![analysis_version, subjects_version, sharpness_version, aesthetic_version],
             |r| r.get(0),
         )?;
         Ok(n as u64)

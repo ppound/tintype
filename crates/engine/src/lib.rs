@@ -7,11 +7,12 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use tintype_analyze::{
-    AESTHETIC_VERSION, ANALYSIS_VERSION, AestheticScorer, ImageEncoder, MIN_RATINGS, SHARPNESS_VERSION, TasteModel,
-    TextEncoder, taste_features,
+    AESTHETIC_VERSION, ANALYSIS_VERSION, AUTO_TAG_VERSION, AestheticScorer, AutoTagger, ImageEncoder, MIN_RATINGS,
+    SHARPNESS_VERSION, TasteModel, TextEncoder, taste_features,
 };
 use tintype_catalog::{Catalog, StackPlace};
 use tintype_faces::{FACES_VERSION, FaceAnalyzer};
@@ -253,13 +254,16 @@ pub struct Stats {
     pub folders: Vec<String>,
     /// The kinds of file each folder includes, in `folders` order (`None`: all).
     pub folder_kinds: Vec<Option<Vec<FileKind>>>,
-    /// Photos not yet fully analyzed (smart search, sharpness, aesthetic score)...
+    /// Photos not yet fully analyzed (smart search, auto tags, sharpness, aesthetic score)...
     pub unanalyzed: u64,
     /// ...which takes two passes, one after the other: photos still to embed
-    /// for smart search, then photos still to measure for quality. `Analyze`
-    /// counts its `remaining` as the sum of the two.
+    /// for smart search and tag, then photos still to measure for quality.
+    /// `Analyze` counts its `remaining` as the sum of the two.
     pub needs_smart_search: u64,
     pub needs_quality: u64,
+    /// Of `needs_smart_search`, photos already embedded that only need auto
+    /// tags: quick, as no photo is opened.
+    pub needs_subjects: u64,
     /// Smart search models are downloaded; if not, `smart_download_bytes` will be.
     pub smart_ready: bool,
     pub smart_download_bytes: u64,
@@ -315,6 +319,8 @@ const AESTHETIC_MODELS: [ModelSpec; 2] = [CLIP_L14_VISION, LAION_AESTHETIC_HEAD]
 
 /// Models smart search needs, downloaded together.
 const SMART_MODELS: [ModelSpec; 3] = [SIGLIP_VISION, SIGLIP_TEXT, SIGLIP_TOKENIZER];
+/// Photos auto-tagged per `Analyze` call when only tags are needed.
+const SUBJECTS_BATCH: usize = 2000;
 
 /// Long edge, in pixels, of cached grid thumbnails.
 pub const THUMB_EDGE: u32 = 400;
@@ -330,6 +336,7 @@ pub struct Engine {
     batches_since_recognize: u32,
     image_encoder: Option<Arc<ImageEncoder>>,
     text_encoder: Option<TextEncoder>,
+    auto_tagger: Option<AutoTagger>,
     /// All image embeddings, loaded on the first smart search after a change.
     embeddings: Option<Vec<(i64, Vec<f32>)>>,
     /// Every stacked photo's place, loaded on the first stacked search after a change.
@@ -360,6 +367,7 @@ impl Engine {
             batches_since_recognize: 0,
             image_encoder: None,
             text_encoder: None,
+            auto_tagger: None,
             embeddings: None,
             stack_places: None,
             aesthetic_scorer: None,
@@ -489,11 +497,14 @@ impl Engine {
                 folder_kinds: self.catalog.root_kinds()?.into_iter().map(|(_, k)| k).collect(),
                 unanalyzed: self.catalog.count_needing_any_analysis(
                     ANALYSIS_VERSION,
+                    AUTO_TAG_VERSION,
                     SHARPNESS_VERSION,
                     self.aesthetic_version()?,
                 )?,
-                needs_smart_search: self.catalog.count_needing_analysis(ANALYSIS_VERSION)?,
+                needs_smart_search: self.catalog.count_needing_analysis(ANALYSIS_VERSION)?
+                    + self.catalog.count_needing_subjects(ANALYSIS_VERSION, AUTO_TAG_VERSION)?,
                 needs_quality: self.catalog.count_needing_quality(SHARPNESS_VERSION, self.aesthetic_version()?)?,
+                needs_subjects: self.catalog.count_needing_subjects(ANALYSIS_VERSION, AUTO_TAG_VERSION)?,
                 smart_ready: SMART_MODELS.iter().all(|m| self.models.is_installed(m)),
                 smart_download_bytes: SMART_MODELS
                     .iter()
@@ -665,9 +676,9 @@ impl Engine {
         Ok(scorer)
     }
 
-    /// One batch of analysis: smart search embeddings first, then quality
-    /// (sharpness, and the aesthetic score when it is on). `remaining`
-    /// counts the work left in both passes.
+    /// One batch of analysis: smart search embeddings and auto tags first,
+    /// then quality (sharpness, and the aesthetic score when it is on).
+    /// `remaining` counts the work left in both passes.
     fn analyze(&mut self, batch: usize, events: &mut dyn FnMut(Event)) -> Result<AnalyzeReport> {
         let aesthetic = self.aesthetic_version()?;
         let mut report = if self.catalog.count_needing_analysis(ANALYSIS_VERSION)? > 0 {
@@ -678,7 +689,15 @@ impl Engine {
                 self.embeddings = None;
                 self.taste = None;
             }
+            // The photos just embedded.
+            self.tag_subjects(batch.max(1), events)?;
             r
+        } else if self.catalog.count_needing_subjects(ANALYSIS_VERSION, AUTO_TAG_VERSION)? > 0 {
+            // Photos embedded before auto tags existed, or tagged with older labels.
+            let started = Instant::now();
+            let processed = self.tag_subjects(SUBJECTS_BATCH, events)?;
+            events(Event::Analyze { done: processed, total: processed });
+            AnalyzeReport { processed, elapsed_ms: started.elapsed().as_millis() as u64, ..Default::default() }
         } else {
             let scorer = match aesthetic {
                 Some(_) => Some(self.aesthetic_scorer(events)?),
@@ -706,12 +725,33 @@ impl Engine {
             }
         };
         report.remaining = self.catalog.count_needing_analysis(ANALYSIS_VERSION)?
+            + self.catalog.count_needing_subjects(ANALYSIS_VERSION, AUTO_TAG_VERSION)?
             + self.catalog.count_needing_quality(SHARPNESS_VERSION, aesthetic)?;
         // Bursts are found by looks, and covers prefer the sharpest frame: stack again once the work is done.
         if report.processed > 0 && (report.remaining == 0 || report.cancelled) {
             self.restack()?;
         }
         Ok(report)
+    }
+
+    /// Auto tags for up to `limit` analyzed photos that need them, from their
+    /// embeddings. Returns how many photos were tagged.
+    fn tag_subjects(&mut self, limit: usize, events: &mut dyn FnMut(Event)) -> Result<u64> {
+        let todo = self.catalog.photos_needing_subjects(ANALYSIS_VERSION, AUTO_TAG_VERSION, limit)?;
+        if todo.is_empty() {
+            return Ok(0);
+        }
+        if self.auto_tagger.is_none() {
+            let tagger = AutoTagger::new(self.text_encoder(events)?)?;
+            self.auto_tagger = Some(tagger);
+        }
+        let tagger = self.auto_tagger.as_ref().expect("made above");
+        let subjects: Vec<(i64, Vec<String>)> =
+            todo.into_iter().map(|(id, e)| (id, e.map_or_else(Vec::new, |e| tagger.tags(&e)))).collect();
+        self.catalog.set_subjects(&subjects, AUTO_TAG_VERSION)?;
+        let pending = self.catalog.index_pending()?;
+        self.reindex_photos(pending)?;
+        Ok(subjects.len() as u64)
     }
 
     /// The user's learned taste, fitted on their ratings the first time it is needed after a change.

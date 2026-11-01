@@ -42,7 +42,7 @@ remembers the choice for that folder when it rescans; a folder inside another on
 its own. Tintype reads photos where they are and never changes, moves or deletes one. You get:
 
 - a search bar (same syntax as below), with facet filters for camera, lens,
-  date, tags, file type and folder in the sidebar
+  date, tags, subjects, people, file type and folder in the sidebar
 - a thumbnail grid. Size it with the slider; arrow keys move the selection.
 - **stacks**: copies, versions and burst frames of one shot show as one photo with a
   count badge (the best rated, else the largest, else the latest edit). Click the badge,
@@ -63,6 +63,12 @@ its own. Tintype reads photos where they are and never changes, moves or deletes
   picture ("dog on a beach", "red car at night") and the best matches come
   first. Field terms like `year:2024` or `rating:>=4` still filter. Tintype
   looks at each photo once first (**Analyze photos**, about 0.15 s per photo).
+
+- **Subjects**: analyzed photos are also tagged with what they show, from a list of 150
+  (Animals › Dog, Nature › Beach, Buildings › Lighthouse, Events › Wedding…). Filter by
+  them in the sidebar, click one in the details panel, or search `subject:dog` (plain
+  words match them too). They're kept apart from your own tags and never written to
+  sidecars. Tagging photos analyzed already takes seconds, as no photo is opened.
 
 - **Best photos first** (sort menu): once you have rated about 30 photos in Tintype, it
   learns your taste from them and orders by it, and the details panel shows its guess
@@ -109,6 +115,18 @@ Looks alone never stack photos taken at different times: the same view at sunris
 and sunset scores as alike as an edit. A stack of bursts spans at most a minute.
 Bursts and repeats need **Analyze photos** (smart search) to have run.
 
+### Subjects
+
+Each label is a SigLIP prompt ("a photo of a dog.") with its own threshold on the
+similarity to the photo's embedding; a photo gets at most six, the clearest first. One
+threshold for all doesn't work: generic prompts ("a street", "a landscape") score high on
+everything. The thresholds were set by looking at photos just above and below them in a
+36,000-photo library, preferring a missed tag to a wrong one, and checked against random
+photos. Labels the model couldn't tell apart reliably were dropped: sunrise from sunset,
+selfies from portraits, "sea" from "beach", "sports" and "running". Small or partly hidden
+things are often missed. Changing labels or thresholds bumps `AUTO_TAG_VERSION`, and
+every photo is tagged again on the next analysis.
+
 ### Quality
 
 Turn on **Settings > Aesthetic score** and Tintype scores every photo that doesn't have a
@@ -148,7 +166,8 @@ tintype-cli rate 678 5
 tintype-cli faces                           # find faces in photos not yet checked
 tintype-cli people                          # named people and unnamed groups
 tintype-cli name "Ada" 113 681 871          # name faces (ids from `people`)
-tintype-cli analyze                         # embed photos for smart search
+tintype-cli analyze                         # embed photos for smart search, and tag subjects
+tintype-cli facets subjects -p Animals      # how many dogs, cats, birds…
 tintype-cli settings --sidecars off         # stop writing .xmp sidecars
 tintype-cli settings --aesthetic on         # score photos (LAION, 1.2 GB); then `analyze`
 tintype-cli search --sort best              # your taste once you've rated ~30 photos
@@ -167,11 +186,12 @@ All terms must match.
 
 | Query                          | Finds                                       |
 |--------------------------------|---------------------------------------------|
-| `beach sunset`                 | words anywhere: path, EXIF values, tags     |
+| `beach sunset`                 | words anywhere: path, EXIF values, tags, subjects |
 | `make:canon` `model:x-t5` `lens:23mm` `filename:dscf` | one field |
 | `iso:>1600` `aperture:<=2.8` `focal:[70 TO 200]` `shutter:<0.002` | numeric ranges |
 | `year:2024` `year:[2019 TO 2021]` | capture year                             |
 | `rating:>=4` `tag:family`      | your own metadata                           |
+| `subject:dog`                  | auto tags (plain words match them too)      |
 | `person:ada` `faces:>=3`       | people (named faces) and number of faces    |
 | `gps:true`                     | photos with a location                      |
 | `stack:12`                     | every photo of one stack                    |
@@ -182,7 +202,7 @@ With `--smart` (the app's **Smart** toggle), terms with a `field:` still filter 
 above and the remaining words are matched against what the photos show. Results are
 ranked by match; photos far behind the best match are left out.
 
-Facet fields for `tintype-cli facets`: `camera`, `lenses`, `date`, `ext`, `tags`, `people`, `folder`.
+Facet fields for `tintype-cli facets`: `camera`, `lenses`, `date`, `ext`, `tags`, `subjects`, `people`, `folder`.
 
 ## Architecture
 
@@ -265,8 +285,8 @@ a screenshot and exits. `TINTYPE_SCREENSHOT_SELECT=<n>` selects a result first,
 3. ~~Faces: detect, group, name, suggest, merge~~
    Next: faster face passes, HEIC/DNG previews for detection, scaling grouping past ~20k faces
 4. ~~Smart search (SigLIP embeddings)~~, ~~stacks of duplicates, versions and bursts~~,
-   ~~aesthetic score, learned taste~~
-   Next: zero-shot auto-tags, a review list for culling
+   ~~aesthetic score, learned taste~~, ~~auto tags (subjects)~~
+   Next: a review list for culling, near-duplicate finder
 5. ~~Installers for Windows, macOS and Linux from CI; app icon~~
    Next: code signing (Apple notarization, Windows signing), auto-update
 6. ~~Read and write PhotoStat XMP sidecars~~

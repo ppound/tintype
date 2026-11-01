@@ -30,7 +30,11 @@ impl Catalog {
             )?,
             None => tx.execute("DELETE FROM embeddings WHERE photo_id = ?1", [photo_id])?,
         };
-        tx.execute("UPDATE photos SET analysis_version = ?2 WHERE id = ?1", params![photo_id, version])?;
+        // A new embedding needs new auto tags.
+        tx.execute(
+            "UPDATE photos SET analysis_version = ?2, subjects_version = 0 WHERE id = ?1",
+            params![photo_id, version],
+        )?;
         tx.commit()?;
         Ok(())
     }

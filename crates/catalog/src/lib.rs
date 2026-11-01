@@ -15,6 +15,7 @@ mod faces;
 mod quality;
 mod sidecars;
 mod stacks;
+mod subjects;
 pub use faces::{FaceGroup, FaceInfo, FaceRow, NewFace, Person, Suggestion};
 pub use quality::QualityTodo;
 pub use sidecars::SidecarStamp;
@@ -139,6 +140,11 @@ const MIGRATIONS: &[&str] = &[
     -- The kinds of file a library folder includes ("jpeg,raw"); NULL: all.
     ALTER TABLE roots ADD COLUMN kinds TEXT;
 "#,
+    r#"
+    -- Auto tags found from the embedding, one "Group/Name" per line; never the user's own tags.
+    ALTER TABLE photos ADD COLUMN subjects TEXT;
+    ALTER TABLE photos ADD COLUMN subjects_version INTEGER NOT NULL DEFAULT 0;
+"#,
 ];
 
 /// A photo as produced by a scan, before it has an id.
@@ -177,6 +183,8 @@ pub struct PhotoRecord {
     pub error: Option<String>,
     pub rating: Option<u8>,
     pub tags: Vec<String>,
+    /// Auto tags ("Animals/Dog"), the clearest first; kept apart from `tags`.
+    pub subjects: Vec<String>,
     /// Names of the people in this photo (confirmed or suggested), sorted.
     pub people: Vec<String>,
     /// Faces found in this photo.
@@ -440,7 +448,8 @@ impl Catalog {
 }
 
 const SELECT_PHOTO: &str =
-    "SELECT id, path, size, mtime_ns, hash, meta, error, rating, indexed_at, stack, stack_cover, aesthetic FROM photos";
+    "SELECT id, path, size, mtime_ns, hash, meta, error, rating, indexed_at, stack, stack_cover, aesthetic, subjects
+     FROM photos";
 
 /// A row with its metadata JSON not yet parsed (parsing errors aren't rusqlite errors).
 struct RawRecord {
@@ -468,6 +477,7 @@ fn read_row(r: &Row) -> rusqlite::Result<RawRecord> {
             error: r.get(6)?,
             rating: r.get(7)?,
             tags: Vec::new(),
+            subjects: r.get::<_, Option<String>>(12)?.map_or_else(Vec::new, |s| s.lines().map(String::from).collect()),
             people: Vec::new(),
             faces: 0,
             stack: r.get(9)?,

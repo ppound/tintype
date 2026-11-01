@@ -31,6 +31,8 @@ struct AnalyzeProgress {
     /// ...and photos done, counting through both passes.
     done: u64,
     stop: bool,
+    /// Step 1 only needs auto tags: the photos were embedded already.
+    tagging: bool,
 }
 
 impl AnalyzeProgress {
@@ -38,7 +40,8 @@ impl AnalyzeProgress {
     fn status(&self, done: u64) -> (String, f32) {
         let fraction = done as f32 / (self.smart + self.quality).max(1) as f32;
         let (what, done, of, step) = if done < self.smart || self.quality == 0 {
-            ("Analyzing photos for smart search", done.min(self.smart), self.smart, 1)
+            let what = if self.tagging { "Tagging photos by subject" } else { "Analyzing photos for smart search" };
+            (what, done.min(self.smart), self.smart, 1)
         } else {
             ("Measuring photo quality", (done - self.smart).min(self.quality), self.quality, 2)
         };
@@ -58,11 +61,13 @@ impl SmartState {
 
 impl TintypeApp {
     /// While the aesthetic score is on, photos without one are scored by
-    /// themselves: on launch, after a scan, and when it is turned on.
+    /// themselves: on launch, after a scan, and when it is turned on. Auto
+    /// tags for photos analyzed already are quick, so they always are.
     pub(super) fn auto_analyze(&mut self) {
         let on = self.aesthetic.is_some_and(|(on, _)| on);
         let todo = self.stats.as_ref().is_some_and(|s| s.unanalyzed > 0);
-        if on && todo && !self.smart.held && self.screenshot.is_none() {
+        let tags = self.stats.as_ref().is_some_and(|s| s.smart_ready && s.needs_subjects > 0);
+        if ((on && todo) || tags) && !self.smart.held && self.screenshot.is_none() {
             self.start_analyze();
         }
     }
@@ -72,8 +77,10 @@ impl TintypeApp {
             return;
         }
         self.smart.held = false;
-        let (smart, quality) = self.stats.as_ref().map_or((0, 0), |s| (s.needs_smart_search, s.needs_quality));
-        self.smart.analyzing = Some(AnalyzeProgress { smart, quality, done: 0, stop: false });
+        let (smart, quality, tagging) = self.stats.as_ref().map_or((0, 0, false), |s| {
+            (s.needs_smart_search, s.needs_quality, s.needs_subjects == s.needs_smart_search)
+        });
+        self.smart.analyzing = Some(AnalyzeProgress { smart, quality, done: 0, stop: false, tagging });
         self.scan = Some(ScanState { label: "Preparing smart search…".into(), fraction: None });
         self.backend.send(Job::Analyze, Command::Analyze { batch: ANALYZE_BATCH });
     }
@@ -219,13 +226,15 @@ mod tests {
 
     #[test]
     fn analysis_shows_each_pass() {
-        let a = AnalyzeProgress { smart: 36_624, quality: 36_624, done: 0, stop: false };
+        let a = AnalyzeProgress { smart: 36_624, quality: 36_624, done: 0, stop: false, tagging: false };
         assert_eq!(a.status(0).0, "Analyzing photos for smart search: 0 of 36,624  (step 1 of 2)");
         let (label, fraction) = a.status(36_625);
         assert_eq!(label, "Measuring photo quality: 1 of 36,624  (step 2 of 2)");
         assert!((fraction - 0.5).abs() < 0.001);
-        let quality_only = AnalyzeProgress { smart: 0, quality: 10, done: 0, stop: false };
+        let quality_only = AnalyzeProgress { smart: 0, quality: 10, done: 0, stop: false, tagging: false };
         assert_eq!(quality_only.status(3).0, "Measuring photo quality: 3 of 10");
+        let tags = AnalyzeProgress { smart: 36_624, quality: 10, done: 0, stop: false, tagging: true };
+        assert_eq!(tags.status(2_000).0, "Tagging photos by subject: 2,000 of 36,624  (step 1 of 2)");
     }
 
     #[test]

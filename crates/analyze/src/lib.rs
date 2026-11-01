@@ -6,12 +6,15 @@
 //! [`match_probability`] turns that into SigLIP's calibrated probability that
 //! the text describes the image.
 //!
-//! Also: the LAION aesthetic score and sharpness ([`quality`]), and a model of
-//! the user's own taste learned from their ratings ([`taste`]).
+//! Also: auto tags from the embeddings ([`autotags`]), the LAION aesthetic
+//! score and sharpness ([`quality`]), and a model of the user's own taste
+//! learned from their ratings ([`taste`]).
 
+mod autotags;
 mod quality;
 mod taste;
 
+pub use autotags::{AUTO_TAG_VERSION, AutoTagger, LABELS, Label};
 pub use quality::{AESTHETIC_VERSION, AestheticScorer, QUALITY_EDGE, SHARPNESS_VERSION, sharpness};
 pub use taste::{MIN_RATINGS, TasteModel, features as taste_features};
 

@@ -40,6 +40,7 @@ const FACETS: &[(&str, &str)] = &[
     ("Lens", "lenses"),
     ("Date", "date"),
     ("Tags", "tags"),
+    ("Subjects", "subjects"),
     ("People", "people"),
     ("File type", "ext"),
     ("Folder", "folder"),
@@ -889,6 +890,7 @@ impl TintypeApp {
         let mut add_tag = None;
         let mut remove_tag = None;
         let mut open_stack = None;
+        let mut show_subject = None;
 
         ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
             ui.add_space(8.0);
@@ -986,6 +988,20 @@ impl TintypeApp {
                 edit.request_focus();
             }
 
+            if !p.subjects.is_empty() {
+                ui.add_space(8.0);
+                ui.label(RichText::new("Subjects").strong())
+                    .on_hover_text("Found automatically from what the photo shows. Your own tags are kept apart.");
+                ui.horizontal_wrapped(|ui| {
+                    for s in &p.subjects {
+                        let name = s.rsplit('/').next().unwrap_or(s);
+                        if ui.link(name).on_hover_text(format!("Show every photo of: {name}")).clicked() {
+                            show_subject = Some(facet_path(&s.split('/').collect::<Vec<_>>()));
+                        }
+                    }
+                });
+            }
+
             self.photo_faces_section(ui, p.id);
 
             if let Some(e) = &p.error {
@@ -1007,6 +1023,9 @@ impl TintypeApp {
 
         if let Some(stack) = open_stack {
             self.open_stack(Some(stack));
+        }
+        if let Some(path) = show_subject {
+            self.set_filter("subjects", Some(path));
         }
         if let Some(r) = new_rating {
             self.rate(p.id, r);
