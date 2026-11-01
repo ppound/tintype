@@ -5087,7 +5087,9 @@ dependencies = [
  "image",
  "rfd",
  "serde",
+ "tempfile",
  "tintype-engine",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

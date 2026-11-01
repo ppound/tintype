@@ -52,7 +52,10 @@ its own. Tintype reads photos where they are and never changes, moves or deletes
   selected photo. Space pauses, ← → browse, 1–5 rate (0 clears), T adds tags (with Tab
   completion; `-tag` removes one), + − change the time per photo, I keeps the caption on
   screen, H lists the keys and Esc leaves
-- details, a 1–5 star rating (or keys 0–5) and tags for the selected photo
+- details, a 1–5 star rating (or keys 0–5) and tags for the selected photo. Click a tag
+  or subject to see every photo with it; × removes a tag
+- **Open** the photo in your default app (Ctrl+O), or **Print…** it with the Windows
+  print dialog (Ctrl+P; on macOS and Linux, open it and print from the viewer)
 - **Rescan** to pick up new, changed and removed files in all your folders
 - a **People** tab: Tintype finds faces, groups the ones that look alike, and
   you name a group once. New faces that match a named person are suggested for

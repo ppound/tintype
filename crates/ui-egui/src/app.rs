@@ -18,6 +18,7 @@ use tintype_engine::{
 };
 
 use crate::backend::{Backend, Job, Msg, Reply};
+use crate::os;
 use crate::thumbs::{Slot, Thumbs};
 
 mod people;
@@ -45,6 +46,8 @@ const FACETS: &[(&str, &str)] = &[
     ("File type", "ext"),
     ("Folder", "folder"),
 ];
+/// The shortcut modifier, as written in tooltips.
+const COMMAND: &str = if cfg!(target_os = "macos") { "Cmd" } else { "Ctrl" };
 const STAR: Color32 = Color32::from_rgb(242, 184, 48);
 
 #[derive(Serialize, Deserialize)]
@@ -408,6 +411,15 @@ impl TintypeApp {
         self.search();
     }
 
+    /// Prints a photo with the system's dialog, or opens it in the default app.
+    fn hand_to_os(&mut self, path: &str, print: bool) {
+        let path = Path::new(path);
+        let result = if print { os::print(path) } else { os::open(path) };
+        if let Err(e) = result {
+            self.notify(e, true);
+        }
+    }
+
     fn notify(&mut self, text: impl Into<String>, error: bool) {
         self.notice = Some(Notice { text: text.into(), error, at: Instant::now() });
     }
@@ -611,6 +623,13 @@ impl TintypeApp {
         if self.view == View::Loupe && pressed(Key::Escape) {
             self.view = View::Grid;
             self.scroll_to_selected = true;
+        }
+        let open = ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::O));
+        let print = os::CAN_PRINT && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::P));
+        if (open || print)
+            && let Some(path) = self.selected.map(|i| self.results[i].path.clone())
+        {
+            self.hand_to_os(&path, print);
         }
         let digits = [Key::Num0, Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5];
         if let Some(id) = self.selected.map(|i| self.results[i].id)
@@ -901,6 +920,8 @@ impl TintypeApp {
         let mut open_stack = None;
         let mut show_subject = None;
         let mut show_tag = None;
+        // Some(true): print the photo; Some(false): open it in the default app.
+        let mut hand_over = None;
 
         ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
             ui.add_space(8.0);
@@ -910,9 +931,20 @@ impl TintypeApp {
             if let Some(dir) = path.parent() {
                 ui.label(RichText::new(dir.display().to_string()).small().weak());
             }
-            if ui.small_button("Copy path").clicked() {
-                ui.ctx().copy_text(p.path.clone());
-            }
+            ui.horizontal(|ui| {
+                if ui.small_button("Copy path").clicked() {
+                    ui.ctx().copy_text(p.path.clone());
+                }
+                let open = ui.small_button("Open").on_hover_text(format!("Open in your default app ({}+O)", COMMAND));
+                if open.clicked() {
+                    hand_over = Some(false);
+                }
+                if os::CAN_PRINT
+                    && ui.small_button("Print…").on_hover_text(format!("Print with Windows ({}+P)", COMMAND)).clicked()
+                {
+                    hand_over = Some(true);
+                }
+            });
             let hit = self.selected.and_then(|i| self.results.get(i)).filter(|h| h.id == p.id);
             if let Some((stack, n)) = hit.and_then(|h| h.stack.map(|s| (s, h.stack_size))).filter(|(_, n)| *n > 1) {
                 ui.horizontal(|ui| {
@@ -1043,6 +1075,9 @@ impl TintypeApp {
         }
         if let Some(path) = show_tag {
             self.set_filter("tags", Some(path));
+        }
+        if let Some(print) = hand_over {
+            self.hand_to_os(&p.path, print);
         }
         if let Some(r) = new_rating {
             self.rate(p.id, r);

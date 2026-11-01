@@ -3,6 +3,7 @@
 
 mod app;
 mod backend;
+mod os;
 mod thumbs;
 
 use std::io::Write;
