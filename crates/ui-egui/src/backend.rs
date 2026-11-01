@@ -1,5 +1,6 @@
 //! Runs the engine on its own thread so the UI never blocks on a command.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -65,7 +66,16 @@ impl Backend {
         thread::Builder::new()
             .name("tintype-engine".into())
             .spawn(move || {
-                for (job, seq, cmd) in jobs {
+                let mut queue = VecDeque::new();
+                loop {
+                    if queue.is_empty() {
+                        match jobs.recv() {
+                            Ok(next) => queue.push_back(next),
+                            Err(_) => break,
+                        }
+                    }
+                    queue.extend(jobs.try_iter());
+                    let (job, seq, cmd) = queue.remove(next_job(&queue)).expect("a queued command");
                     let run = std::panic::AssertUnwindSafe(|| {
                         engine.execute(cmd, &mut |e| {
                             let _ = out.send(Msg::Progress(e));
@@ -129,4 +139,26 @@ impl Backend {
 /// Work done in batches, which other commands may interrupt between photos.
 fn is_background(job: Job) -> bool {
     matches!(job, Job::Analyze | Job::FindFaces | Job::Scan)
+}
+
+/// Which queued command runs next: the first one that isn't background work,
+/// if any. A batch queued ahead of a click would stop at once (it is paused
+/// for the click), and as the UI queues the next batch before refreshing what
+/// it shows, the batches would never get anywhere.
+fn next_job<T>(queue: &VecDeque<(Job, u64, T)>) -> usize {
+    queue.iter().position(|(job, ..)| !is_background(*job)).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clicks_run_before_queued_batches() {
+        let queue: VecDeque<(Job, u64, ())> =
+            [(Job::FindFaces, 1, ()), (Job::People, 2, ()), (Job::Search, 3, ())].into();
+        assert_eq!(next_job(&queue), 1);
+        let queue: VecDeque<(Job, u64, ())> = [(Job::Scan, 1, ()), (Job::Analyze, 2, ())].into();
+        assert_eq!(next_job(&queue), 0, "batches keep their order");
+    }
 }
