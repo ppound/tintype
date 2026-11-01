@@ -144,7 +144,7 @@ impl TintypeApp {
                 self.tab = Tab::Photos;
                 self.query.clear();
                 self.filters = vec![("people", format!("/{name}"))];
-                self.search();
+                self.show_new_results();
             }
             Action::OpenPhoto { photo, person } => {
                 self.tab = Tab::Photos;

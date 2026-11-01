@@ -396,6 +396,15 @@ impl TintypeApp {
         if let Some(p) = path.filter(|p| p != "/") {
             self.filters.push((field, p));
         }
+        self.show_new_results();
+    }
+
+    /// The user changed what is shown (a filter, the search): back to the
+    /// grid, as the photo shown full size may not be among the new results.
+    fn show_new_results(&mut self) {
+        if self.view == View::Loupe {
+            self.view = View::Grid;
+        }
         self.search();
     }
 
@@ -648,11 +657,11 @@ impl TintypeApp {
                 self.search_due = Some(Instant::now() + TYPING_DEBOUNCE);
             }
             if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                self.search();
+                self.show_new_results();
             }
             if !self.query.is_empty() && ui.small_button("×").on_hover_text("Clear search").clicked() {
                 self.query.clear();
-                self.search();
+                self.show_new_results();
             }
             if ui
                 .toggle_value(&mut self.settings.smart, "Smart")
@@ -662,7 +671,7 @@ impl TintypeApp {
                 )
                 .changed()
             {
-                self.search();
+                self.show_new_results();
             }
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -733,10 +742,10 @@ impl TintypeApp {
             });
             if clear {
                 self.filters.clear();
-                self.search();
+                self.show_new_results();
             } else if let Some(i) = remove {
                 self.filters.remove(i);
-                self.search();
+                self.show_new_results();
             }
         }
         ui.add_space(4.0);
@@ -1304,7 +1313,7 @@ impl eframe::App for TintypeApp {
         if let Some(due) = self.search_due {
             let now = Instant::now();
             if now >= due {
-                self.search();
+                self.show_new_results();
             } else {
                 ctx.request_repaint_after(due - now);
             }
