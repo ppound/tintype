@@ -44,9 +44,11 @@ pub fn analyze(
                 if cancel.load(Ordering::Relaxed) {
                     return;
                 }
-                let embedding = tintype_codecs::decode_preview(Path::new(path), ANALYSIS_EDGE)
-                    .ok()
-                    .and_then(|img| encoder.embed(&img).ok());
+                let embedding = crate::guarded(|| {
+                    tintype_codecs::decode_preview(Path::new(path), ANALYSIS_EDGE)
+                        .ok()
+                        .and_then(|img| encoder.embed(&img).ok())
+                });
                 let _ = tx.send((*id, embedding));
             });
         });

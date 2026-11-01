@@ -111,6 +111,11 @@ Bursts and repeats need **Analyze photos** (smart search) to have run.
 
 ### Quality
 
+Turn on **Settings > Aesthetic score** and Tintype scores every photo that doesn't have a
+score yet: right away, then on each launch and after each scan. Cancel stops it until you
+click **N photos not scored yet** in the status bar. Photos are first analyzed for smart
+search, which the score builds on.
+
 Measured on the same library before choosing:
 
 - **Aesthetic score**: the LAION improved aesthetic predictor (CLIP ViT-L/14 and a small

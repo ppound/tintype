@@ -78,9 +78,11 @@ pub fn find_faces(
                 if cancel.load(Ordering::Relaxed) {
                     return;
                 }
-                let faces = tintype_codecs::decode_preview(Path::new(path), tintype_faces::ANALYSIS_EDGE)
-                    .ok()
-                    .and_then(|img| analyzer.analyze(&img).ok());
+                let faces = crate::guarded(|| {
+                    tintype_codecs::decode_preview(Path::new(path), tintype_faces::ANALYSIS_EDGE)
+                        .ok()
+                        .and_then(|img| analyzer.analyze(&img).ok())
+                });
                 let _ = tx.send((*id, faces));
             });
         });

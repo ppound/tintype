@@ -60,11 +60,17 @@ impl Backend {
             .name("tintype-engine".into())
             .spawn(move || {
                 for (job, seq, cmd) in jobs {
-                    let result = engine.execute(cmd, &mut |e| {
-                        let _ = out.send(Msg::Progress(e));
-                        ctx.request_repaint();
+                    let run = std::panic::AssertUnwindSafe(|| {
+                        engine.execute(cmd, &mut |e| {
+                            let _ = out.send(Msg::Progress(e));
+                            ctx.request_repaint();
+                        })
                     });
-                    let result = result.map_err(|e| e.to_string());
+                    // A bug in one command reports an error (see crash.log) and the engine carries on.
+                    let result = match std::panic::catch_unwind(run) {
+                        Ok(r) => r.map_err(|e| e.to_string()),
+                        Err(_) => Err("Tintype hit a bug. Details are in crash.log in the library folder.".into()),
+                    };
                     if out.send(Msg::Reply(Box::new(Reply { job, seq, result }))).is_err() {
                         break;
                     }

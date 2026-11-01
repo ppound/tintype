@@ -519,7 +519,10 @@ impl TintypeApp {
                 self.search();
             }
 
-            (Job::Stats, Ok(Response::Stats(s))) => self.stats = Some(s),
+            (Job::Stats, Ok(Response::Stats(s))) => {
+                self.stats = Some(s);
+                self.auto_analyze();
+            }
             (Job::SyncSidecars, Ok(Response::Sidecars(s))) => {
                 if s.imported > 0 {
                     self.notify(format!("Read {} updated .xmp sidecars", thousands(s.imported)), false);
@@ -537,9 +540,11 @@ impl TintypeApp {
                 let turned_on = aesthetic && self.aesthetic.is_some_and(|(was, _)| !was);
                 self.aesthetic = Some((aesthetic, aesthetic_download_bytes));
                 if turned_on {
-                    // Download (if needed) and score right away.
+                    // Download (if needed) and score right away, once the stats count what's to do.
+                    self.smart.held = false;
                     self.refresh_stats();
-                    self.start_analyze();
+                } else {
+                    self.auto_analyze();
                 }
                 if let Some(s) = sidecars.filter(|s| s.written + s.failed > 0) {
                     let failed = if s.failed > 0 { format!(", {} failed", thousands(s.failed)) } else { String::new() };
@@ -797,6 +802,9 @@ impl TintypeApp {
                 if !self.filters.is_empty() || !self.query.trim().is_empty() {
                     ui.weak(format!("· {} match", thousands(self.total as u64)));
                 }
+            }
+            if self.scan.is_none() {
+                self.resume_link(ui);
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if let Some(n) = &self.notice {

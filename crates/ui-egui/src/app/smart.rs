@@ -18,6 +18,9 @@ const AESTHETIC_SECONDS_PER_PHOTO: f64 = 0.35;
 #[derive(Default)]
 pub(super) struct SmartState {
     analyzing: Option<AnalyzeProgress>,
+    /// Don't start analysis by itself: the user stopped it, or it stopped
+    /// making progress. Starting it by hand clears this.
+    pub held: bool,
 }
 
 /// Analysis runs two passes, one after the other: smart search, then quality.
@@ -48,15 +51,27 @@ impl SmartState {
     pub fn stop(&mut self) {
         if let Some(a) = &mut self.analyzing {
             a.stop = true;
+            self.held = true;
         }
     }
 }
 
 impl TintypeApp {
+    /// While the aesthetic score is on, photos without one are scored by
+    /// themselves: on launch, after a scan, and when it is turned on.
+    pub(super) fn auto_analyze(&mut self) {
+        let on = self.aesthetic.is_some_and(|(on, _)| on);
+        let todo = self.stats.as_ref().is_some_and(|s| s.unanalyzed > 0);
+        if on && todo && !self.smart.held && self.screenshot.is_none() {
+            self.start_analyze();
+        }
+    }
+
     pub(super) fn start_analyze(&mut self) {
         if self.smart.analyzing.is_some() || self.scan.is_some() {
             return;
         }
+        self.smart.held = false;
         let (smart, quality) = self.stats.as_ref().map_or((0, 0), |s| (s.needs_smart_search, s.needs_quality));
         self.smart.analyzing = Some(AnalyzeProgress { smart, quality, done: 0, stop: false });
         self.scan = Some(ScanState { label: "Preparing smart search…".into(), fraction: None });
@@ -82,6 +97,8 @@ impl TintypeApp {
                 a.done += r.processed;
                 if r.cancelled || a.stop || r.remaining == 0 || r.processed == 0 {
                     let (status, _) = a.status(a.done);
+                    // Stuck: don't start again by itself.
+                    self.smart.held |= r.remaining > 0;
                     self.smart.analyzing = None;
                     self.scan = None;
                     let msg = if r.remaining > 0 {
@@ -100,6 +117,7 @@ impl TintypeApp {
                 }
             }
             (Job::Analyze, Err(e)) => {
+                self.smart.held = true;
                 self.smart.analyzing = None;
                 self.scan = None;
                 self.notify(format!("Analysis stopped: {e}"), true);
@@ -130,6 +148,20 @@ impl TintypeApp {
                 "Turn on Settings > Aesthetic score, or rate {} more photos, so Tintype can order by quality.",
                 s.taste_needed - s.taste_ratings
             )
+        }
+    }
+
+    /// In the status bar after the aesthetic pass was stopped: a way to carry on.
+    pub(super) fn resume_link(&mut self, ui: &mut egui::Ui) {
+        let on = self.aesthetic.is_some_and(|(on, _)| on);
+        let todo = self.stats.as_ref().map_or(0, |s| s.unanalyzed);
+        if !on || todo == 0 || !self.smart.held || self.smart.analyzing.is_some() {
+            return;
+        }
+        ui.weak("·");
+        let link = ui.link(format!("{} photos not scored yet", thousands(todo)));
+        if link.on_hover_text("Score them now").clicked() {
+            self.start_analyze();
         }
     }
 

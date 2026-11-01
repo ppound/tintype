@@ -45,15 +45,23 @@ pub fn measure_quality(
                 if cancel.load(Ordering::Relaxed) {
                     return;
                 }
-                let img = tintype_codecs::decode_preview(Path::new(&t.path), QUALITY_EDGE).ok();
-                let sharp = t
-                    .sharpness
-                    .then(|| (img.as_ref().and_then(|i| tintype_analyze::sharpness(i).ok()), SHARPNESS_VERSION));
-                let aes = match (t.aesthetic, scorer) {
-                    (true, Some(s)) => Some((img.as_ref().and_then(|i| s.score(i).ok()), AESTHETIC_VERSION)),
-                    _ => None,
-                };
-                let _ = tx.send((t.id, sharp, aes, img.is_none()));
+                let measured = crate::guarded(|| {
+                    let img = tintype_codecs::decode_preview(Path::new(&t.path), QUALITY_EDGE).ok();
+                    let sharp = t
+                        .sharpness
+                        .then(|| (img.as_ref().and_then(|i| tintype_analyze::sharpness(i).ok()), SHARPNESS_VERSION));
+                    let aes = match (t.aesthetic, scorer) {
+                        (true, Some(s)) => Some((img.as_ref().and_then(|i| s.score(i).ok()), AESTHETIC_VERSION)),
+                        _ => None,
+                    };
+                    Some((sharp, aes, img.is_none()))
+                });
+                // A photo that crashed the decoder is recorded as measured, without values.
+                let (sharp, aes, failed) = measured.unwrap_or_else(|| {
+                    let aes = (t.aesthetic && scorer.is_some()).then_some((None, AESTHETIC_VERSION));
+                    (t.sharpness.then_some((None, SHARPNESS_VERSION)), aes, true)
+                });
+                let _ = tx.send((t.id, sharp, aes, failed));
             });
         });
         for (id, sharp, aes, failed) in rx {

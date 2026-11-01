@@ -5,7 +5,8 @@ mod app;
 mod backend;
 mod thumbs;
 
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use eframe::egui;
@@ -16,6 +17,7 @@ pub use app::{ScreenshotPlan, TintypeApp};
 /// Opens the library and runs the app until the window closes.
 pub fn run(library: Option<PathBuf>) -> Result<(), String> {
     let library = library.or_else(tintype_engine::default_library_dir).ok_or("could not find a data folder")?;
+    log_panics(&library);
     let screenshot = std::env::var_os("TINTYPE_SCREENSHOT").map(|path| ScreenshotPlan {
         path: path.into(),
         select: std::env::var("TINTYPE_SCREENSHOT_SELECT").ok().and_then(|v| v.parse().ok()),
@@ -48,4 +50,45 @@ pub fn run(library: Option<PathBuf>) -> Result<(), String> {
         }),
     )
     .map_err(|e| e.to_string())
+}
+
+/// Crash reports go to `crash.log` in the library folder: a release build on
+/// Windows has no console to print them to. A crash of the window itself also
+/// says so in a dialog; panics in workers are caught, and logged here too.
+fn log_panics(library: &Path) {
+    let log = library.join("crash.log");
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default(info);
+        let thread = std::thread::current();
+        let name = thread.name().unwrap_or("unnamed");
+        let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let entry = format!(
+            "--- unix time {secs}, Tintype {}, thread '{name}': {info}
+{}
+",
+            env!("CARGO_PKG_VERSION"),
+            std::backtrace::Backtrace::force_capture()
+        );
+        // Start over rather than grow without bound.
+        let keep = std::fs::metadata(&log).is_ok_and(|m| m.len() < 1_000_000);
+        let file = std::fs::OpenOptions::new().create(true).append(keep).write(true).truncate(!keep).open(&log);
+        if let Ok(mut f) = file {
+            let _ = f.write_all(entry.as_bytes());
+        }
+        if name == "main" {
+            rfd::MessageDialog::new()
+                .set_title("Tintype")
+                .set_description(format!(
+                    "Tintype ran into a bug and has to close. Nothing in your photos was changed.
+
+{info}
+
+Details are in {}",
+                    log.display()
+                ))
+                .set_level(rfd::MessageLevel::Error)
+                .show();
+        }
+    }));
 }

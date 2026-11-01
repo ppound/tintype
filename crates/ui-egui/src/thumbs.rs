@@ -222,11 +222,21 @@ fn worker(
                 requests = queue.ready.wait(requests).expect("queue lock");
             }
         };
-        let outcome = match req.kind {
+        let decode = || match req.kind {
             Kind::Thumb if !wanted.lock().expect("wanted lock").contains(&req.id) => Outcome::Skipped,
             Kind::Thumb => to_outcome(cache.get(req.path.as_ref())),
             Kind::Preview => to_outcome(tintype_engine::decode_preview(&req.path, PREVIEW_EDGE)),
             Kind::Face => to_outcome(tintype_engine::decode_preview(&req.path, FACE_EDGE)),
+        };
+        // A decoder bug on one odd file shows as an error, not a dead worker.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(decode))
+            .unwrap_or_else(|_| Outcome::Failed("This photo could not be decoded".into()));
+        // A buffer of the wrong size would panic when uploaded as a texture.
+        let outcome = match outcome {
+            Outcome::Done(img) if img.pixels.len() != img.width as usize * img.height as usize * 4 => {
+                Outcome::Failed("This photo could not be decoded".into())
+            }
+            o => o,
         };
         if tx.send((req.id, req.kind, outcome)).is_err() {
             return;

@@ -14,3 +14,9 @@ pub use quality::{QualityReport, measure_quality};
 pub use scan::{ScanOptions, ScanProgress, ScanReport, normalize_path, scan};
 pub use sidecars::{SidecarReport, SyncMode, import_changed, sync_sidecars, write_sidecars};
 pub use stacks::{STACKS_VERSION, refresh_cover, restack};
+
+/// Runs `f` on one photo, turning a panic (a decoder bug on one odd file)
+/// into `None`, so one photo can't stop a pass over thousands.
+pub(crate) fn guarded<T>(f: impl FnOnce() -> Option<T>) -> Option<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).ok().flatten()
+}

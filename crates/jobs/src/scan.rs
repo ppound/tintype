@@ -286,9 +286,11 @@ fn is_ignored(entry: &walkdir::DirEntry) -> bool {
 
 fn analyze(c: &Candidate, opts: &ScanOptions) -> NewPhoto {
     let path = Path::new(&c.path);
-    let (meta, error) = match tintype_meta::read_path(path) {
-        Ok(m) => (m, None),
-        Err(e) => (Default::default(), Some(e.to_string())),
+    let read = crate::guarded(|| Some(tintype_meta::read_path(path).map_err(|e| e.to_string())));
+    let (meta, error) = match read {
+        Some(Ok(m)) => (m, None),
+        Some(Err(e)) => (Default::default(), Some(e)),
+        None => (Default::default(), Some("reading the metadata crashed".into())),
     };
     let hash = (opts.hash && !c.content_unchanged).then(|| hash_file(path).ok()).flatten();
     NewPhoto {
