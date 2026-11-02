@@ -26,6 +26,7 @@ pub fn run(library: Option<PathBuf>) -> Result<(), String> {
     let screenshot = std::env::var_os("TINTYPE_SCREENSHOT").map(|path| ScreenshotPlan {
         path: path.into(),
         select: std::env::var("TINTYPE_SCREENSHOT_SELECT").ok().and_then(|v| v.parse().ok()),
+        select_name: std::env::var("TINTYPE_SCREENSHOT_SELECT_NAME").ok(),
         view: std::env::var("TINTYPE_SCREENSHOT_VIEW").ok(),
         smart_query: std::env::var("TINTYPE_SCREENSHOT_SMART").ok(),
         add_folder: std::env::var_os("TINTYPE_SCREENSHOT_ADD").map(PathBuf::from),

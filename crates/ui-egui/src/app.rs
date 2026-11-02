@@ -113,6 +113,8 @@ pub struct ScreenshotPlan {
     pub path: PathBuf,
     /// Select this result index once results arrive.
     pub select: Option<usize>,
+    /// Or select the first result whose path contains this text.
+    pub select_name: Option<String>,
     /// "loupe", "slideshow" (or "slideshow-keys", "slideshow-tags"), "stack", "similar" (photos like the
     /// selected one), "people" or "person" (the first person's page).
     pub view: Option<String>,
@@ -127,6 +129,8 @@ struct Screenshot {
     frames: u32,
     selected: bool,
     requested: bool,
+    /// Frame the selection was scrolled into view again, once the layout settled.
+    rescrolled_at: Option<u32>,
     saved: Arc<AtomicBool>,
 }
 
@@ -238,6 +242,7 @@ impl TintypeApp {
                 frames: 0,
                 selected: false,
                 requested: false,
+                rescrolled_at: None,
                 saved: Arc::default(),
             }),
         };
@@ -1176,7 +1181,8 @@ impl TintypeApp {
         {
             let top = (i / cols) as f32 * stride;
             let (offset, height) = self.grid_view;
-            if top < offset {
+            // Height 0: the grid hasn't been shown yet, so put the row at the top.
+            if top < offset || height <= 0.0 {
                 area = area.vertical_scroll_offset(top);
             } else if top + stride > offset + height {
                 area = area.vertical_scroll_offset(top + stride - height);
@@ -1333,7 +1339,9 @@ impl TintypeApp {
         if !s.selected && self.searched_once {
             s.selected = true;
             let view = s.plan.view.clone();
-            if let Some(i) = s.plan.select.filter(|_| !self.results.is_empty()) {
+            let named =
+                s.plan.select_name.as_ref().and_then(|n| self.results.iter().position(|h| h.path.contains(n.as_str())));
+            if let Some(i) = named.or(s.plan.select).filter(|_| !self.results.is_empty()) {
                 self.select(i.min(self.results.len() - 1));
             }
             match view.as_deref() {
@@ -1387,7 +1395,14 @@ impl TintypeApp {
         let detail_ready = self.selected.is_none() || self.detail.is_some() || s.frames > 1800;
         let settled = s.frames > 90 && detail_ready && self.thumbs.queued() == 0 && self.scan.is_none();
         let settled = settled && (slide_shown || s.frames > 1800);
-        if s.selected && settled && !s.requested {
+        // The details panel narrows the grid when it appears, which can move the selection
+        // out of view: scroll to it once more, and capture a few frames later.
+        if s.selected && settled && s.rescrolled_at.is_none() {
+            s.rescrolled_at = Some(s.frames);
+            self.scroll_to_selected = true;
+        }
+        let rescrolled = s.rescrolled_at.is_some_and(|f| s.frames > f + 10);
+        if s.selected && settled && rescrolled && !s.requested {
             s.requested = true;
             let (path, saved) = (s.plan.path.clone(), s.saved.clone());
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::ScreenshotCallback::new(move |img| {

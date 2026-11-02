@@ -11,6 +11,11 @@ sidecars, so ratings, tags and people carry over.
 Status: indexing, search, the desktop app, face recognition, smart (semantic)
 search, duplicate stacking and quality scores work, on Windows, macOS and Linux.
 
+**[User guide](docs/README.md)**, with screenshots: getting started, browsing, searching,
+people, ratings and tags, and the command line.
+
+![Tintype](docs/images/main.jpg)
+
 ## Install
 
 Download the installer for your system from [Releases](https://github.com/ppound/tintype/releases):
@@ -278,7 +283,8 @@ Locally: `cargo build --release -p tintype -p tintype-cli`, then
 The icon is drawn by `assets/icon/make_icon.py`.
 
 `TINTYPE_SCREENSHOT=out.png tintype` runs the app until thumbnails settle, saves
-a screenshot and exits. `TINTYPE_SCREENSHOT_SELECT=<n>` selects a result first,
+a screenshot and exits. `TINTYPE_SCREENSHOT_SELECT=<n>` selects a result first
+(`TINTYPE_SCREENSHOT_SELECT_NAME=<text>`: the first whose path contains the text),
 `TINTYPE_SCREENSHOT_VIEW=loupe` opens it full size (`slideshow`, `slideshow-keys`,
 `slideshow-tags`: the slideshow, with its key list or tag box; `stack`: opens the first stack), and
 `TINTYPE_SCREENSHOT_SMART="dog on a beach"` runs a smart search, and
