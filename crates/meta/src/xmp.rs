@@ -11,10 +11,10 @@ use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::name::{Namespace, ResolveResult};
 use quick_xml::{NsReader, Writer};
 
-const NS_RDF: &[u8] = b"http://www.w3.org/1999/02/22-rdf-syntax-ns#";
-const NS_XMP: &[u8] = b"http://ns.adobe.com/xap/1.0/";
-const NS_DC: &[u8] = b"http://purl.org/dc/elements/1.1/";
-const NS_IPTC_EXT: &[u8] = b"http://iptc.org/std/Iptc4xmpExt/2008-02-29/";
+const NS_RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+const NS_XMP: &str = "http://ns.adobe.com/xap/1.0/";
+const NS_DC: &str = "http://purl.org/dc/elements/1.1/";
+const NS_IPTC_EXT: &str = "http://iptc.org/std/Iptc4xmpExt/2008-02-29/";
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -96,16 +96,16 @@ enum Owned {
     People,
 }
 
-fn owned(ns: &ResolveResult, local: &[u8]) -> Option<Owned> {
+fn owned(ns: &ResolveResult, local: &str) -> Option<Owned> {
     match (ns, local) {
-        (ResolveResult::Bound(Namespace(NS_XMP)), b"Rating") => Some(Owned::Rating),
-        (ResolveResult::Bound(Namespace(NS_DC)), b"subject") => Some(Owned::Tags),
-        (ResolveResult::Bound(Namespace(NS_IPTC_EXT)), b"PersonInImage") => Some(Owned::People),
+        (ResolveResult::Bound(Namespace(NS_XMP)), "Rating") => Some(Owned::Rating),
+        (ResolveResult::Bound(Namespace(NS_DC)), "subject") => Some(Owned::Tags),
+        (ResolveResult::Bound(Namespace(NS_IPTC_EXT)), "PersonInImage") => Some(Owned::People),
         _ => None,
     }
 }
 
-fn is_rdf(ns: &ResolveResult, local: &[u8], name: &[u8]) -> bool {
+fn is_rdf(ns: &ResolveResult, local: &str, name: &str) -> bool {
     matches!(ns, ResolveResult::Bound(Namespace(NS_RDF))) && local == name
 }
 
@@ -128,39 +128,36 @@ pub fn parse(xml: &str) -> Result<Sidecar> {
         match event {
             Event::Start(ref e) | Event::Empty(ref e) => {
                 let local = e.local_name();
-                if is_rdf(&ns, local.as_ref(), b"Description") {
+                if is_rdf(&ns, local.as_ref(), "Description") {
                     for a in e.attributes() {
                         let a = a?;
                         let (ans, alocal) = r.resolver().resolve_attribute(a.key);
                         if owned(&ans, alocal.as_ref()) == Some(Owned::Rating) {
-                            out.rating = parse_rating(&String::from_utf8_lossy(&a.value));
+                            out.rating = parse_rating(&a.value);
                         }
                     }
                 } else if let Some(o) = owned(&ns, local.as_ref()) {
                     current = matches!(event, Event::Start(_)).then_some(o);
                     text.clear();
-                } else if current.is_some() && is_rdf(&ns, local.as_ref(), b"li") {
+                } else if current.is_some() && is_rdf(&ns, local.as_ref(), "li") {
                     in_li = matches!(event, Event::Start(_));
                     text.clear();
                 }
             }
             Event::Text(ref t) if current.is_some() => {
-                text.push_str(&t.decode().map_err(|e| Error::Xml(e.to_string()))?);
+                text.push_str(t);
             }
             Event::GeneralRef(ref g) if current.is_some() => {
                 let resolved = match g.resolve_char_ref()? {
                     Some(c) => Some(c.to_string()),
-                    None => {
-                        let name = g.decode().map_err(|e| Error::Xml(e.to_string()))?;
-                        quick_xml::escape::resolve_predefined_entity(&name).map(str::to_string)
-                    }
+                    None => quick_xml::escape::resolve_predefined_entity(g).map(str::to_string),
                 };
                 text.push_str(&resolved.ok_or_else(|| Error::Xml("unknown entity".into()))?);
             }
             Event::End(ref e) => {
                 let local = e.local_name();
                 let value = text.trim();
-                if is_rdf(&ns, local.as_ref(), b"li") {
+                if is_rdf(&ns, local.as_ref(), "li") {
                     match current {
                         Some(Owned::Tags) if in_li && !value.is_empty() => out.tags.push(value.to_string()),
                         Some(Owned::People) if in_li && !value.is_empty() => out.people.push(value.to_string()),
@@ -198,7 +195,7 @@ pub fn update(existing: Option<&str>, sidecar: &Sidecar) -> Result<String> {
         let starts_owned =
             matches!(&event, Event::Start(e) | Event::Empty(e) if owned(&ns, e.local_name().as_ref()).is_some());
         if skip == 0 {
-            if matches!(&event, Event::Text(t) if t.iter().all(u8::is_ascii_whitespace)) {
+            if matches!(&event, Event::Text(t) if t.bytes().all(|b| b.is_ascii_whitespace())) {
                 if let Some(p) = pending.take() {
                     w.write_event(p)?;
                 }
@@ -221,9 +218,9 @@ pub fn update(existing: Option<&str>, sidecar: &Sidecar) -> Result<String> {
             continue;
         }
         match event {
-            Event::Start(ref e) | Event::Empty(ref e) if is_rdf(&ns, e.local_name().as_ref(), b"Description") => {
+            Event::Start(ref e) | Event::Empty(ref e) if is_rdf(&ns, e.local_name().as_ref(), "Description") => {
                 let empty = matches!(event, Event::Empty(_));
-                let mut start = BytesStart::new(String::from_utf8_lossy(e.name().as_ref()).into_owned());
+                let mut start = BytesStart::new(e.name().as_ref().to_string());
                 let mut declared = Vec::new();
                 for a in e.attributes() {
                     let a = a?;
@@ -231,8 +228,8 @@ pub fn update(existing: Option<&str>, sidecar: &Sidecar) -> Result<String> {
                     if owned(&ans, alocal.as_ref()) == Some(Owned::Rating) {
                         continue;
                     }
-                    if let Some(prefix) = a.key.as_ref().strip_prefix(b"xmlns:") {
-                        declared.push(prefix.to_vec());
+                    if let Some(prefix) = a.key.as_ref().strip_prefix("xmlns:") {
+                        declared.push(prefix.to_string());
                     }
                     start.push_attribute(a);
                 }
@@ -242,9 +239,9 @@ pub fn update(existing: Option<&str>, sidecar: &Sidecar) -> Result<String> {
                 }
                 written = true;
                 // Our properties go into the first description.
-                let mut ensure_ns = |prefix: &str, uri: &[u8]| {
-                    if !declared.iter().any(|d| d == prefix.as_bytes()) {
-                        start.push_attribute((format!("xmlns:{prefix}").as_bytes(), uri));
+                let mut ensure_ns = |prefix: &str, uri: &str| {
+                    if !declared.iter().any(|d| d == prefix) {
+                        start.push_attribute((format!("xmlns:{prefix}").as_str(), uri));
                     }
                 };
                 if sidecar.rating.is_some() {
@@ -262,7 +259,7 @@ pub fn update(existing: Option<&str>, sidecar: &Sidecar) -> Result<String> {
                 w.write_event(Event::Start(start))?;
                 write_bags(&mut w, sidecar)?;
                 if empty {
-                    w.write_event(Event::End(BytesEnd::new(String::from_utf8_lossy(e.name().as_ref()))))?;
+                    w.write_event(Event::End(BytesEnd::new(e.name().as_ref().to_string())))?;
                 }
             }
             Event::Start(ref e) if owned(&ns, e.local_name().as_ref()).is_some() => skip = 1,

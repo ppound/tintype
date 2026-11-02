@@ -9,7 +9,7 @@
 //! ONNX Runtime backend for larger models and GPUs can sit beside it later.
 
 use std::fs::File;
-use std::io::{BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -168,7 +168,7 @@ impl ModelStore {
         out.sync_all()?;
         drop(out);
 
-        if format!("{:x}", hasher.finalize()) != spec.sha256 {
+        if hex(&hasher.finalize()) != spec.sha256 {
             let _ = std::fs::remove_file(&part);
             return Err(Error::Checksum { model: spec.name });
         }
@@ -180,8 +180,21 @@ impl ModelStore {
 /// SHA-256 of a file, hex.
 pub fn sha256_file(path: &Path) -> Result<String> {
     let mut hasher = Sha256::new();
-    std::io::copy(&mut BufReader::new(File::open(path)?), &mut hasher)?;
-    Ok(format!("{:x}", hasher.finalize()))
+    let mut file = BufReader::new(File::open(path)?);
+    loop {
+        let chunk = file.fill_buf()?;
+        if chunk.is_empty() {
+            break;
+        }
+        hasher.update(chunk);
+        let n = chunk.len();
+        file.consume(n);
+    }
+    Ok(hex(&hasher.finalize()))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// A dense f32 tensor, row-major.
