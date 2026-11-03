@@ -3,6 +3,9 @@
 `tintype-cli` is installed with the app and does everything the app does, on the same
 library, so you can script Tintype or use it on a computer without a screen.
 
+A library can only be open in one place at a time: while the app has it open,
+`tintype-cli` says so and stops. Close the app first (or use `--library` for another).
+
 ```sh
 tintype-cli scan ~/Pictures                  # add a folder; the first scan reads everything
 tintype-cli scan ~/Pictures --types jpeg     # only JPEGs from this folder (also: raw, heif, other)

@@ -49,6 +49,8 @@ pub enum Error {
     Analysis(#[from] tintype_analyze::Error),
     #[error("{path}: {source}")]
     Library { path: PathBuf, source: std::io::Error },
+    #[error("this library is open in Tintype already; close it first")]
+    InUse,
     #[error("no photo {0} in the library")]
     PhotoNotFound(String),
     #[error("no library folders to rescan; add one first")]
@@ -285,6 +287,14 @@ pub enum Event {
 }
 
 /// Where the library lives when the user doesn't choose: the OS data dir.
+/// Whether another Tintype (the app or the CLI) has the library in `dir`
+/// open: it holds the search index's writer lock while it does.
+pub fn library_in_use(dir: &Path) -> bool {
+    let lock = dir.join("index").join(".tantivy-writer.lock");
+    let Ok(file) = std::fs::OpenOptions::new().write(true).open(lock) else { return false };
+    matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock))
+}
+
 pub fn default_library_dir() -> Option<PathBuf> {
     directories::ProjectDirs::from("", "", "Tintype").map(|d| d.data_dir().join("library"))
 }
@@ -367,8 +377,14 @@ impl Engine {
     pub fn open(dir: &Path) -> Result<Self> {
         let lib_err = |source| Error::Library { path: dir.to_path_buf(), source };
         std::fs::create_dir_all(dir).map_err(lib_err)?;
+        if library_in_use(dir) {
+            return Err(Error::InUse);
+        }
         let catalog = Catalog::open(&dir.join("catalog.db"))?;
-        let (index, fresh) = PhotoIndex::open(&dir.join("index"))?;
+        let (index, fresh) = PhotoIndex::open(&dir.join("index")).map_err(|e| match e {
+            tintype_index::Error::Locked => Error::InUse,
+            e => e.into(),
+        })?;
         let thumbs = Arc::new(ThumbCache::new(dir.join("thumbs"), THUMB_EDGE));
         let mut engine = Self {
             dir: dir.to_path_buf(),
@@ -1091,6 +1107,18 @@ mod tests {
         };
         let Response::Search(r) = engine.execute(cmd, &mut |_| {}).unwrap() else { panic!() };
         r.hits.into_iter().map(|h| Path::new(&h.path).file_name().unwrap().to_string_lossy().into_owned()).collect()
+    }
+
+    #[test]
+    fn a_library_opens_once_at_a_time() {
+        let lib = tempfile::tempdir().unwrap();
+        assert!(!library_in_use(lib.path()));
+        let engine = Engine::open(lib.path()).unwrap();
+        assert!(library_in_use(lib.path()));
+        assert!(matches!(Engine::open(lib.path()), Err(Error::InUse)));
+        drop(engine);
+        assert!(!library_in_use(lib.path()));
+        Engine::open(lib.path()).unwrap();
     }
 
     #[test]

@@ -22,9 +22,11 @@ use crate::os;
 use crate::thumbs::{Slot, Thumbs};
 
 mod people;
+mod selection;
 mod slideshow;
 mod smart;
 use people::PeopleState;
+use selection::{Gathering, HelperNotices};
 use slideshow::Slideshow;
 use smart::SmartState;
 
@@ -116,7 +118,7 @@ pub struct ScreenshotPlan {
     /// Or select the first result whose path contains this text.
     pub select_name: Option<String>,
     /// "loupe", "slideshow" (or "slideshow-keys", "slideshow-tags"), "stack", "similar" (photos like the
-    /// selected one), "people" or "person" (the first person's page).
+    /// selected one), "picked" (several photos picked), "people" or "person" (the first person's page).
     pub view: Option<String>,
     /// Run this smart search first (an empty string shows smart mode with no query).
     pub smart_query: Option<String>,
@@ -170,6 +172,13 @@ pub struct TintypeApp {
     expanded: HashSet<&'static str>,
 
     selected: Option<usize>,
+    /// More photos picked with Ctrl+ or Shift+click, by id (empty: just `selected`).
+    picked: HashSet<i64>,
+    /// Where a Shift+click range starts.
+    anchor: Option<usize>,
+    gathering: Option<Gathering>,
+    /// Notices from helper threads (showing a folder, copying photos).
+    helper_notices: HelperNotices,
     detail: Option<PhotoRecord>,
     detail_seq: u64,
     tag_input: String,
@@ -225,6 +234,10 @@ impl TintypeApp {
             folder_base: "/".into(),
             expanded: HashSet::new(),
             selected: None,
+            picked: HashSet::new(),
+            anchor: None,
+            gathering: None,
+            helper_notices: crossbeam_channel::unbounded(),
             detail: None,
             detail_seq: 0,
             tag_input: String::new(),
@@ -494,6 +507,7 @@ impl TintypeApp {
                 self.query_error = None;
                 self.searched_once = true;
                 self.selected = prev.and_then(|id| self.results.iter().position(|h| h.id == id));
+                self.keep_picked();
                 if self.selected.is_none() {
                     self.detail = None;
                     self.view = View::Grid;
@@ -639,7 +653,15 @@ impl TintypeApp {
             _ => None,
         };
         if let Some(t) = target {
+            self.clear_picked();
             self.select(t);
+            self.anchor = Some(t);
+        }
+        if self.view == View::Grid && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::A)) {
+            self.pick_all();
+        }
+        if self.view == View::Grid && pressed(Key::Escape) {
+            self.clear_picked();
         }
         if self.view == View::Grid && pressed(Key::Enter) && self.selected.is_some() {
             self.view = View::Loupe;
@@ -879,7 +901,11 @@ impl TintypeApp {
                 if !self.filters.is_empty() || !self.query.trim().is_empty() {
                     ui.weak(format!("· {} match", thousands(self.total as u64)));
                 }
+                if !self.picked.is_empty() {
+                    ui.weak(format!("· {} selected", thousands(self.picked.len() as u64)));
+                }
             }
+            self.gathering_status(ui);
             if self.scan.is_none() {
                 self.resume_link(ui);
             }
@@ -957,6 +983,7 @@ impl TintypeApp {
     }
 
     fn details(&mut self, ui: &mut egui::Ui) {
+        self.picked_bar(ui);
         let Some(p) = self.detail.clone() else {
             ui.add_space(12.0);
             ui.weak("Select a photo to see its details.");
@@ -969,6 +996,7 @@ impl TintypeApp {
         let mut show_subject = None;
         let mut show_tag = None;
         let mut show_similar = false;
+        let mut show_folder = false;
         // Some(true): print the photo; Some(false): open it in the default app.
         let mut hand_over = None;
 
@@ -980,7 +1008,7 @@ impl TintypeApp {
             if let Some(dir) = path.parent() {
                 ui.label(RichText::new(dir.display().to_string()).small().weak());
             }
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui.small_button("Copy path").clicked() {
                     ui.ctx().copy_text(p.path.clone());
                 }
@@ -993,6 +1021,10 @@ impl TintypeApp {
                 {
                     hand_over = Some(true);
                 }
+                show_folder = ui
+                    .small_button("Show in folder")
+                    .on_hover_text("Open its folder with it selected, to drag it to a browser or anywhere else")
+                    .clicked();
                 show_similar = ui
                     .small_button("Similar")
                     .on_hover_text("Show photos that look like this one, most alike first")
@@ -1132,6 +1164,9 @@ impl TintypeApp {
         if let Some(print) = hand_over {
             self.hand_to_os(&p.path, print);
         }
+        if show_folder {
+            self.show_in_folder(ui.ctx(), vec![PathBuf::from(&p.path)]);
+        }
         if show_similar {
             let name = Path::new(&p.path).file_name().map_or(p.path.clone(), |n| n.to_string_lossy().into_owned());
             self.show_similar(Some((p.id, name)));
@@ -1200,7 +1235,7 @@ impl TintypeApp {
                         if resp.double_clicked() {
                             opened = Some(i);
                         } else if resp.clicked() {
-                            clicked = Some(i);
+                            clicked = Some((i, ui.input(|inp| inp.modifiers)));
                         }
                     }
                 });
@@ -1211,8 +1246,8 @@ impl TintypeApp {
         if let Some(i) = opened {
             self.select(i);
             self.view = View::Loupe;
-        } else if let Some(i) = clicked {
-            self.select(i);
+        } else if let Some((i, modifiers)) = clicked {
+            self.click_cell(i, modifiers);
             self.scroll_to_selected = false;
         }
     }
@@ -1264,7 +1299,7 @@ impl TintypeApp {
                 self.open_stack = Some((stack, n));
             }
         }
-        if self.selected == Some(i) {
+        if self.is_picked(i) {
             painter.rect_stroke(rect, 4.0, Stroke::new(3.0, visuals.selection.bg_fill), StrokeKind::Inside);
         } else if resp.hovered() {
             painter.rect_stroke(rect, 4.0, visuals.widgets.hovered.bg_stroke, StrokeKind::Inside);
@@ -1346,6 +1381,13 @@ impl TintypeApp {
             }
             match view.as_deref() {
                 Some("loupe") => self.view = View::Loupe,
+                // The selected photo, Ctrl+click two on, Ctrl+Shift+click four more.
+                Some("picked") if !self.results.is_empty() => {
+                    let i = self.selected.unwrap_or(0);
+                    let last = self.results.len() - 1;
+                    self.click_cell((i + 2).min(last), egui::Modifiers::COMMAND);
+                    self.click_cell((i + 6).min(last), egui::Modifiers::COMMAND | egui::Modifiers::SHIFT);
+                }
                 Some(v) if v.starts_with("slideshow") => {
                     self.start_slideshow(ctx);
                     self.slideshow_panel(v.trim_start_matches("slideshow-"));
@@ -1424,6 +1466,7 @@ impl eframe::App for TintypeApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.handle_messages();
+        self.poll_helpers();
         self.thumbs.begin_frame(&ctx);
         if let Some(due) = self.search_due {
             let now = Instant::now();

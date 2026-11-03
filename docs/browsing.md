@@ -10,6 +10,29 @@ first and last). The panel on the right shows its details: when and with which c
 was taken, its exposure, size and file, your rating and tags, the subjects Tintype
 found, and the people in it. **All metadata** lists every EXIF field.
 
+## Select several photos
+
+**Ctrl+click** photos to add them to the selection, or to take them out again;
+**Shift+click** selects every photo from the last one clicked to this one, and **Ctrl+A**
+selects all the results. The details panel then says how many are selected, and below
+that shows the last photo clicked. Ratings and tags still apply to that one photo.
+**Clear** or **Esc** goes back to one photo. A stack counts as the photo it shows.
+
+## Show in folder, to upload
+
+To upload photos to Google Photos, Flickr or any other site, select them and click
+**Show in folder** in the details panel. Your file manager opens with them selected:
+drag them onto the site's upload page in your browser.
+
+When the photos are in different folders, Tintype first copies them into one folder of
+its own (**Tintype Upload**, in your temporary files), so you can drag them all at once.
+Two files with the same name are kept apart as `DSCF1234.JPG` and `DSCF1234 (2).JPG`.
+The copies from last time are removed when you do this again. Your photos themselves are
+only read, never moved or changed. For a RAW + JPEG stack, the photo shown is used: the
+JPEG, which is what upload sites want, unless you rated the RAW higher.
+
+On Linux, the folder opens without the photos selected.
+
 ## Filters
 
 The sidebar counts your photos by camera, lens, date, tag, subject, person, file type
@@ -80,8 +103,10 @@ A click on the right half of the screen goes forward, on the left half back.
 | Key | |
 |-----|-|
 | Arrow keys, Home, End | Move the selection |
+| Ctrl+click, Shift+click | Select several photos |
+| Ctrl+A | Select all the results |
 | Enter | Open the selected photo full size |
-| Esc | Back to the grid |
+| Esc | Back to the grid, or back to one selected photo |
 | 0–5 | Rate the selected photo (0 clears) |
 | Ctrl+F | Go to the search box |
 | Ctrl+O | Open in your default app |

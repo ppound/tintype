@@ -3,6 +3,7 @@
 
 mod app;
 mod backend;
+mod gather;
 mod os;
 mod thumbs;
 
@@ -21,6 +22,18 @@ pub use app::{ScreenshotPlan, TintypeApp};
 /// Opens the library and runs the app until the window closes.
 pub fn run(library: Option<PathBuf>) -> Result<(), String> {
     let library = library.or_else(tintype_engine::default_library_dir).ok_or("could not find a data folder")?;
+    // Which Tintype has the library open: older versions don't say, so then any will do.
+    let pid_file = library.join("tintype.pid");
+    if tintype_engine::library_in_use(&library) && !wait_for_restart(&library) {
+        let pid = std::fs::read_to_string(&pid_file).ok().and_then(|p| p.trim().parse().ok());
+        if os::focus_other_instance(pid) {
+            return Ok(());
+        }
+        return Err("Tintype already has this library open, in another window or in tintype-cli.              Switch to it, or close it first."
+            .into());
+    }
+    let _ = std::fs::create_dir_all(&library);
+    let _ = std::fs::write(&pid_file, std::process::id().to_string());
     let started = Instant::now();
     log_panics(&library);
     let screenshot = std::env::var_os("TINTYPE_SCREENSHOT").map(|path| ScreenshotPlan {
@@ -68,11 +81,34 @@ pub fn run(library: Option<PathBuf>) -> Result<(), String> {
         // again, where analysis carries on. Not if it happens right at launch.
         Err(_) if GPU_LOST.load(Ordering::Relaxed) && started.elapsed() > Duration::from_secs(30) => {
             let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-            std::process::Command::new(exe).args(std::env::args_os().skip(1)).spawn().map_err(|e| e.to_string())?;
+            std::process::Command::new(exe)
+                .args(std::env::args_os().skip(1))
+                .env(RESTARTED, "1")
+                .spawn()
+                .map_err(|e| e.to_string())?;
             Ok(())
         }
         Err(panic) => std::panic::resume_unwind(panic),
     }
+}
+
+/// Set for the copy started after the GPU went away (see `run`).
+const RESTARTED: &str = "TINTYPE_RESTARTED";
+
+/// After a restart, waits (up to 30 s) for the old copy to let go of the
+/// library. Returns whether it did.
+fn wait_for_restart(library: &Path) -> bool {
+    if std::env::var_os(RESTARTED).is_none() {
+        return false;
+    }
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(30) {
+        std::thread::sleep(Duration::from_millis(200));
+        if !tintype_engine::library_in_use(library) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Set when the window's renderer panicked, which means the GPU went away.

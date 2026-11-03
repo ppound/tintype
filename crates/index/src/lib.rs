@@ -55,6 +55,8 @@ pub enum Error {
     UnknownFacet(String),
     #[error("invalid facet path {0:?}")]
     BadFacetPath(String),
+    #[error("the search index is open elsewhere (another Tintype)")]
+    Locked,
     #[error("{0} exists but is not a Tintype search index; refusing to replace it")]
     NotAnIndex(std::path::PathBuf),
 }
@@ -217,7 +219,11 @@ impl PhotoIndex {
 
     fn from_index(index: Index, fields: Fields) -> Result<Self> {
         let reader = index.reader_builder().reload_policy(ReloadPolicy::Manual).try_into()?;
-        let writer = index.writer(WRITER_HEAP_BYTES)?;
+        // Only one writer at a time: another Tintype with this library open holds the lock.
+        let writer = index.writer(WRITER_HEAP_BYTES).map_err(|e| match e {
+            tantivy::TantivyError::LockFailure(tantivy::directory::error::LockError::LockBusy, _) => Error::Locked,
+            e => e.into(),
+        })?;
         let mut parser = QueryParser::for_index(&index, vec![fields.text]);
         parser.set_conjunction_by_default();
         Ok(Self { index, reader, writer, fields, parser })

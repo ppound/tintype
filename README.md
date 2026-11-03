@@ -286,7 +286,8 @@ The icon is drawn by `assets/icon/make_icon.py`.
 a screenshot and exits. `TINTYPE_SCREENSHOT_SELECT=<n>` selects a result first
 (`TINTYPE_SCREENSHOT_SELECT_NAME=<text>`: the first whose path contains the text),
 `TINTYPE_SCREENSHOT_VIEW=loupe` opens it full size (`slideshow`, `slideshow-keys`,
-`slideshow-tags`: the slideshow, with its key list or tag box; `stack`: opens the first stack), and
+`slideshow-tags`: the slideshow, with its key list or tag box; `stack`: opens the first stack;
+`picked`: picks several photos), and
 `TINTYPE_SCREENSHOT_SMART="dog on a beach"` runs a smart search, and
 `TINTYPE_SCREENSHOT_ADD=<folder>` opens the add-folder dialog.
 

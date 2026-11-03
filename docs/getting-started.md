@@ -43,6 +43,8 @@ rating, tags and people.
 A photo that can't be read (a disconnected drive, for example) is never treated as
 deleted. Only photos that are really gone are removed from the catalog.
 
+Starting Tintype again while it's open brings its window to the front.
+
 ## Downloads on first use
 
 The features that look at what's in your photos use open models. Each one downloads
