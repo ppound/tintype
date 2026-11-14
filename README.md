@@ -239,7 +239,7 @@ layer 7  apps/tintype (desktop)  apps/tintype-cli
 | `index`    | tantivy full-text, numeric and facet search. Derived from the catalog and rebuilt automatically when missing, outdated or out of sync |
 | `jobs`     | Incremental parallel scanning with move detection; sidecar sync; batched face and analysis passes; people matching. All report progress and can be cancelled |
 | `engine`   | Command registry. CLI, GUI and automation all run the same serde `Command`s |
-| `codecs`   | Thumbnails and previews: DCT-scaled JPEG decoding, RAF embedded JPEGs, a disk thumbnail cache. HEIC and other RAW formats are *planned* |
+| `codecs`   | Thumbnails and previews: DCT-scaled JPEG decoding, RAF and DNG embedded previews, a disk thumbnail cache. HEIC and other RAW formats are *planned* |
 | `infer`    | Model registry, verified downloads, and ONNX inference on `tract` (pure Rust, no native libraries). An ONNX Runtime backend for large models and GPUs is *planned* |
 | `analyze`  | SigLIP image and text embeddings for smart search; LAION aesthetic score, sharpness, learned taste. Auto-tags are *planned* |
 | `faces`    | YuNet detection, landmark alignment, SFace embeddings, Chinese Whispers grouping, k-nearest matching |
@@ -295,9 +295,10 @@ a screenshot and exits. `TINTYPE_SCREENSHOT_SELECT=<n>` selects a result first
 
 1. ~~Indexer + CLI~~
 2. ~~egui shell: thumbnail grid, single-photo view, facet sidebar, search~~
-   Next: RAF sensor dimensions, HEIC and other RAW previews, paging for very large result sets
+   ~~RAF image size, DNG previews~~
+   Next: HEIC and other RAW previews, paging for very large result sets
 3. ~~Faces: detect, group, name, suggest, merge~~
-   Next: faster face passes, HEIC/DNG previews for detection, scaling grouping past ~20k faces
+   Next: faster face passes, HEIC previews for detection, scaling grouping past ~20k faces
 4. ~~Smart search (SigLIP embeddings)~~, ~~stacks of duplicates, versions and bursts~~,
    ~~aesthetic score, learned taste~~, ~~auto tags (subjects)~~, ~~similar photos~~
    Next: a review list for culling (groups of lookalikes taken apart in time)

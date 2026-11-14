@@ -99,11 +99,22 @@ impl JpegSpec {
     /// A minimal Fujifilm RAF: header pointing at this JPEG, then the JPEG. No sensor data.
     pub fn to_raf_bytes(&self) -> Vec<u8> {
         const JPEG_OFFSET: u32 = 160;
+        const HEADER_OFFSET: u32 = 100;
         let jpeg = self.to_bytes();
         let mut out = b"FUJIFILMCCD-RAW 0201FF383501".to_vec();
         out.resize(84, 0);
         out.extend_from_slice(&JPEG_OFFSET.to_be_bytes());
         out.extend_from_slice(&(jpeg.len() as u32).to_be_bytes());
+        // Header block: full sensor and cropped image size, as (height, width).
+        out.extend_from_slice(&HEADER_OFFSET.to_be_bytes());
+        out.extend_from_slice(&20u32.to_be_bytes());
+        out.extend_from_slice(&2u32.to_be_bytes());
+        for (tag, h, w) in [(0x100u16, 4182u16, 6384u16), (0x111, 4160, 6240)] {
+            out.extend_from_slice(&tag.to_be_bytes());
+            out.extend_from_slice(&4u16.to_be_bytes());
+            out.extend_from_slice(&h.to_be_bytes());
+            out.extend_from_slice(&w.to_be_bytes());
+        }
         out.resize(JPEG_OFFSET as usize, 0);
         out.extend_from_slice(&jpeg);
         out

@@ -1,10 +1,10 @@
 //! Image decoding for display: thumbnails and screen-sized previews, upright
 //! according to EXIF orientation.
 //!
-//! JPEGs (and the JPEG embedded in Fujifilm RAF files) are decoded with DCT
-//! scaling, so a 40 MP photo decodes at 1/2 to 1/8 size instead of full size.
-//! Other formats go through the `image` crate. RAW formats other than RAF and
-//! HEIC are not decoded yet.
+//! JPEGs (and the JPEGs embedded in Fujifilm RAF and DNG files) are decoded
+//! with DCT scaling, so a 40 MP photo decodes at 1/2 to 1/8 size instead of
+//! full size. Other formats go through the `image` crate. RAW formats other
+//! than RAF and DNG, and HEIC, are not decoded yet.
 
 use std::fs::File;
 use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
@@ -14,6 +14,8 @@ use std::time::UNIX_EPOCH;
 use image::codecs::jpeg::JpegEncoder;
 use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageReader, RgbImage};
+
+pub mod dng;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -61,6 +63,55 @@ pub fn raf_embedded_jpeg(file: &mut (impl Read + Seek)) -> std::io::Result<Optio
     Ok(Some((offset.into(), len)))
 }
 
+/// Fujifilm RAF tags (in the header block after the embedded JPEG pointer)
+/// holding the raw image size as (height, width): the sensor area the camera
+/// renders from, and the full sensor as a fallback.
+const RAF_CROPPED_SIZE: u16 = 0x111;
+const RAF_FULL_SIZE: u16 = 0x100;
+
+/// Width and height of a Fujifilm RAF's image, as stored (before orientation),
+/// or `None` if `file` is not a RAF or doesn't record it. Matches the size of
+/// the camera's own JPEG. Leaves the file position unspecified.
+pub fn raf_size(file: &mut (impl Read + Seek)) -> std::io::Result<Option<(u32, u32)>> {
+    let mut head = [0u8; 100];
+    file.seek(SeekFrom::Start(0))?;
+    if read_up_to(file, &mut head)? < head.len() || !head.starts_with(RAF_MAGIC) {
+        return Ok(None);
+    }
+    let be32 = |b: &[u8]| u32::from_be_bytes(b[..4].try_into().expect("4 bytes"));
+    let be16 = |b: &[u8]| u16::from_be_bytes(b[..2].try_into().expect("2 bytes"));
+    let (offset, len) = (be32(&head[92..]), be32(&head[96..]));
+    if offset == 0 || len < 4 {
+        return Ok(None);
+    }
+    let mut block = vec![0u8; len.min(64 * 1024) as usize];
+    file.seek(SeekFrom::Start(offset.into()))?;
+    let n = read_up_to(file, &mut block)?;
+    block.truncate(n);
+    if block.len() < 4 {
+        return Ok(None);
+    }
+    // A count, then records of tag (u16), size (u16) and data, all big-endian.
+    let (mut cropped, mut full) = (None, None);
+    let mut rest = &block[4..];
+    for _ in 0..be32(&block) {
+        let [t0, t1, s0, s1, tail @ ..] = rest else { break };
+        let (tag, size) = (be16(&[*t0, *t1]), usize::from(be16(&[*s0, *s1])));
+        let Some(data) = tail.get(..size) else { break };
+        if size == 4 {
+            let (h, w) = (u32::from(be16(data)), u32::from(be16(&data[2..])));
+            let dims = (w > 0 && h > 0).then_some((w, h));
+            match tag {
+                RAF_CROPPED_SIZE => cropped = dims,
+                RAF_FULL_SIZE => full = dims,
+                _ => {}
+            }
+        }
+        rest = &tail[size..];
+    }
+    Ok(cropped.or(full))
+}
+
 /// Like `read_exact`, but a short read is not an error. Returns bytes read.
 pub fn read_up_to(r: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
     let mut n = 0;
@@ -88,6 +139,24 @@ pub fn decode_preview(path: &Path, max_edge: u32) -> Result<Rgba> {
             file.read_exact(&mut jpeg)?;
             decode_jpeg(&jpeg, max_edge)?
         }
+        "dng" => {
+            let mut file = BufReader::new(File::open(path)?);
+            let Some(dng::Dng { orientation, preview: Some(preview), .. }) = dng::Dng::read(&mut file)? else {
+                return Err(Error::Unsupported("this DNG".into()));
+            };
+            let bytes = dng::read_preview(&mut file, &preview)?;
+            let mut img = match preview.encoding {
+                dng::Encoding::Jpeg => decode_jpeg_unrotated(&bytes, max_edge)?,
+                dng::Encoding::Rgb8 => {
+                    let len = (preview.width * preview.height * 3) as usize;
+                    let rgb = bytes.get(..len).ok_or_else(|| Error::Unsupported("this DNG".into()))?.to_vec();
+                    let img = RgbImage::from_raw(preview.width, preview.height, rgb).expect("length checked");
+                    fit(DynamicImage::ImageRgb8(img), max_edge)
+                }
+            };
+            img.apply_orientation(Orientation::from_exif(orientation as u8).unwrap_or(Orientation::NoTransforms));
+            img
+        }
         "png" | "webp" | "tif" | "tiff" => {
             let mut decoder =
                 ImageReader::new(BufReader::new(File::open(path)?)).with_guessed_format()?.into_decoder()?;
@@ -104,6 +173,14 @@ pub fn decode_preview(path: &Path, max_edge: u32) -> Result<Rgba> {
 /// Decodes a JPEG with DCT scaling to the smallest size at least `max_edge`
 /// on the long side, then resizes down and applies EXIF orientation.
 fn decode_jpeg(bytes: &[u8], max_edge: u32) -> Result<DynamicImage> {
+    let mut img = decode_jpeg_unrotated(bytes, max_edge)?;
+    img.apply_orientation(jpeg_orientation(bytes));
+    Ok(img)
+}
+
+/// [`decode_jpeg`] without the orientation step, for JPEGs whose orientation
+/// is recorded by their container.
+fn decode_jpeg_unrotated(bytes: &[u8], max_edge: u32) -> Result<DynamicImage> {
     let mut decoder = jpeg_decoder::Decoder::new(Cursor::new(bytes));
     decoder.read_info()?;
     let info = decoder.info().expect("read_info succeeded");
@@ -129,9 +206,7 @@ fn decode_jpeg(bytes: &[u8], max_edge: u32) -> Result<DynamicImage> {
             .collect(),
     };
     let img = RgbImage::from_raw(w, h, rgb).ok_or_else(|| Error::Unsupported("this JPEG layout".into()))?;
-    let mut img = fit(DynamicImage::ImageRgb8(img), max_edge);
-    img.apply_orientation(jpeg_orientation(bytes));
-    Ok(img)
+    Ok(fit(DynamicImage::ImageRgb8(img), max_edge))
 }
 
 fn jpeg_orientation(bytes: &[u8]) -> Orientation {
@@ -257,6 +332,62 @@ mod tests {
         std::fs::write(&path, raf).unwrap();
         let img = decode_preview(&path, 400).unwrap();
         assert_eq!((img.width, img.height), (400, 300));
+    }
+
+    #[test]
+    fn raf_size_reads_cropped_size() {
+        let mut raf = RAF_MAGIC.to_vec();
+        raf.resize(92, 0);
+        raf.extend_from_slice(&100u32.to_be_bytes());
+        raf.extend_from_slice(&20u32.to_be_bytes());
+        raf.extend_from_slice(&2u32.to_be_bytes());
+        for (tag, h, w) in [(RAF_FULL_SIZE, 4182u16, 6384u16), (RAF_CROPPED_SIZE, 4160, 6240)] {
+            raf.extend_from_slice(&tag.to_be_bytes());
+            raf.extend_from_slice(&4u16.to_be_bytes());
+            raf.extend_from_slice(&h.to_be_bytes());
+            raf.extend_from_slice(&w.to_be_bytes());
+        }
+        assert_eq!(raf_size(&mut Cursor::new(&raf)).unwrap(), Some((6240, 4160)));
+        // Truncated or absent header blocks are not errors.
+        assert_eq!(raf_size(&mut Cursor::new(&raf[..112])).unwrap(), Some((6384, 4182)));
+        raf[92..100].fill(0);
+        assert_eq!(raf_size(&mut Cursor::new(&raf)).unwrap(), None);
+        assert_eq!(raf_size(&mut Cursor::new(b"not a raf")).unwrap(), None);
+    }
+
+    #[test]
+    fn dng_uses_largest_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.DNG");
+        std::fs::write(&path, dng::tests::dng((32, 24), (6048, 4032), (6000, 4000), &jpeg(800, 600), (800, 600), 1))
+            .unwrap();
+        let img = decode_preview(&path, 400).unwrap();
+        assert_eq!((img.width, img.height), (400, 300));
+        let px = &img.pixels[(150 * 400 + 10) * 4..][..3];
+        assert!(px[0] > 200 && px[2] < 60, "the JPEG, not the green thumbnail: {px:?}");
+
+        let parsed = dng::Dng::read(&mut File::open(&path).unwrap()).unwrap().unwrap();
+        assert_eq!(parsed.size, Some((6000, 4000)), "default crop, not the raw or a preview");
+    }
+
+    #[test]
+    fn dng_falls_back_to_rgb_thumbnail_and_orientation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.dng");
+        // The JPEG claims a smaller size than the thumbnail, so the thumbnail wins.
+        std::fs::write(&path, dng::tests::dng((64, 48), (4000, 3000), (3990, 2990), &jpeg(16, 12), (16, 12), 6))
+            .unwrap();
+        let img = decode_preview(&path, 400).unwrap();
+        assert_eq!((img.width, img.height), (48, 64), "rotated a quarter turn");
+        assert_eq!(&img.pixels[..3], &[0, 200, 0]);
+    }
+
+    #[test]
+    fn dng_without_preview_is_unsupported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.dng");
+        std::fs::write(&path, b"II*\0\x08\0\0\0\0\0\0\0\0\0").unwrap();
+        assert!(matches!(decode_preview(&path, 100), Err(Error::Unsupported(e)) if e == "this DNG"));
     }
 
     #[test]

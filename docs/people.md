@@ -51,4 +51,4 @@ Sidecars from PhotoStat bring their people with them.
   since naming two groups the same merges them, but separating mixed faces means
   taking them out one by one.
 - Very small, blurred or turned-away faces are often not found, or not grouped.
-- DNG and HEIC photos aren't checked for faces yet.
+- HEIC photos and RAW formats other than RAF and DNG aren't checked for faces yet.

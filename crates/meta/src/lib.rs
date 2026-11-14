@@ -23,7 +23,7 @@ pub const PHOTO_EXTENSIONS: &[&str] = &[
 ];
 
 /// Bump when extraction improves, so a rescan re-reads photos cataloged by an older version.
-pub const EXTRACTOR_VERSION: u32 = 3;
+pub const EXTRACTOR_VERSION: u32 = 4;
 
 /// Longest value kept for a single entry in [`PhotoMeta::fields`].
 const MAX_FIELD_LEN: usize = 256;
@@ -96,14 +96,26 @@ pub fn read_path(path: &Path) -> Result<PhotoMeta> {
         Err(e) => return Err(e.into()),
     };
     // The header is authoritative for dimensions; EXIF pixel dimensions are often stale after edits.
-    if raf.is_some() {
-        // The EXIF we read describes the embedded preview, not the sensor image.
-        (meta.width, meta.height) = (None, None);
+    let raw_size = if raf.is_some() {
+        // The EXIF we read describes the embedded preview, not the photo.
+        Some(tintype_codecs::raf_size(&mut File::open(path)?)?)
+    } else if is_dng(path) {
+        // A DNG's first image is usually a small thumbnail; the size is the raw's default crop.
+        Some(tintype_codecs::dng::Dng::read(&mut BufReader::new(File::open(path)?))?.and_then(|d| d.size))
+    } else {
+        None
+    };
+    if let Some(size) = raw_size {
+        (meta.width, meta.height) = size.unzip();
     } else if let Ok(size) = imagesize::size(path) {
         meta.width = u32::try_from(size.width).ok();
         meta.height = u32::try_from(size.height).ok();
     }
     Ok(meta)
+}
+
+fn is_dng(path: &Path) -> bool {
+    path.extension().is_some_and(|e| e.eq_ignore_ascii_case("dng"))
 }
 
 /// Builds [`PhotoMeta`] from parsed EXIF.
@@ -317,7 +329,7 @@ mod tests {
         let m = read_path(&path).unwrap();
         assert_eq!(m.model.as_deref(), Some("Canon EOS R5"));
         assert_eq!(m.iso, Some(1600));
-        assert_eq!(m.width, None, "preview dimensions are not the photo's");
+        assert_eq!((m.width, m.height), (Some(6240), Some(4160)), "the header's size, not the preview's");
     }
 
     #[test]

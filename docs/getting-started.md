@@ -31,6 +31,9 @@ Choose which kinds of file to include: JPEG, RAW, HEIC/AVIF and PNG/TIFF/WebP. I
 camera saves RAW + JPEG pairs, you can add the folder as JPEG only, for example. Tintype
 remembers the choice for that folder, and a folder inside it can have its own.
 
+Fujifilm RAF and DNG files show the preview the camera stored inside them. Other RAW
+formats and HEIC photos are listed and searchable, but have no thumbnail yet.
+
 The first scan reads every photo; later scans only read new and changed files. Add as
 many folders as you like, on any drive, including network drives.
 
