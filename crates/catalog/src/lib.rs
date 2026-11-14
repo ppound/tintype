@@ -35,6 +35,16 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+const SET_RATING: &str = "UPDATE photos SET rating = ?2, rating_source = CASE WHEN ?2 IS NULL THEN NULL ELSE 'user' END
+                          WHERE id = ?1";
+
+fn check_rating(rating: Option<u8>) -> Result<()> {
+    match rating {
+        Some(r) if !(1..=5).contains(&r) => Err(Error::BadRating(r)),
+        _ => Ok(()),
+    }
+}
+
 /// Schema migrations; entry `i` upgrades version `i` to `i + 1`.
 const MIGRATIONS: &[&str] = &[
     r#"
@@ -170,6 +180,24 @@ pub struct Fingerprint {
     pub meta_version: u32,
     /// Content hash, if one was computed; lets a scan recognize moved files.
     pub hash: Option<[u8; 32]>,
+}
+
+/// The ratings and tags of several photos, for editing them together.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Selection {
+    pub photos: u64,
+    /// How many photos have each rating; index 0 counts the unrated ones.
+    pub ratings: [u64; 6],
+    /// Every tag on any of the photos, with how many have it; most common first.
+    pub tags: Vec<(String, u64)>,
+}
+
+impl Selection {
+    /// The rating all the photos share (`Some(None)`: all unrated), or `None` if they differ.
+    pub fn common_rating(&self) -> Option<Option<u8>> {
+        let i = self.ratings.iter().position(|&n| n == self.photos)?;
+        Some((i > 0).then_some(i as u8))
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -350,27 +378,60 @@ impl Catalog {
 
     /// Sets (1-5) or clears the rating. Returns false if the photo doesn't exist.
     pub fn set_rating(&self, id: i64, rating: Option<u8>) -> Result<bool> {
-        if let Some(r) = rating
-            && !(1..=5).contains(&r)
-        {
-            return Err(Error::BadRating(r));
-        }
-        let sql = "UPDATE photos SET rating = ?2, rating_source = CASE WHEN ?2 IS NULL THEN NULL ELSE 'user' END
-                   WHERE id = ?1";
-        Ok(self.conn.execute(sql, params![id, rating])? > 0)
+        check_rating(rating)?;
+        Ok(self.conn.execute(SET_RATING, params![id, rating])? > 0)
     }
 
-    /// Adds and removes tags. Tags are trimmed; empty ones are ignored.
-    pub fn edit_tags(&mut self, id: i64, add: &[String], remove: &[String]) -> Result<()> {
+    /// Sets (1-5) or clears the rating of several photos at once.
+    pub fn set_ratings(&mut self, ids: &[i64], rating: Option<u8>) -> Result<()> {
+        check_rating(rating)?;
         let tx = self.conn.transaction()?;
-        for tag in remove.iter().map(|t| t.trim()) {
-            tx.execute("DELETE FROM photo_tags WHERE photo_id = ?1 AND tag = ?2", params![id, tag])?;
-        }
-        for tag in add.iter().map(|t| t.trim()).filter(|t| !t.is_empty()) {
-            tx.execute("INSERT OR IGNORE INTO photo_tags (photo_id, tag) VALUES (?1, ?2)", params![id, tag])?;
+        {
+            let mut stmt = tx.prepare_cached(SET_RATING)?;
+            for &id in ids {
+                stmt.execute(params![id, rating])?;
+            }
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Adds and removes tags on each of `ids`. Tags are trimmed; empty ones are ignored.
+    pub fn edit_tags(&mut self, ids: &[i64], add: &[String], remove: &[String]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut delete = tx.prepare_cached("DELETE FROM photo_tags WHERE photo_id = ?1 AND tag = ?2")?;
+            let mut insert = tx.prepare_cached("INSERT OR IGNORE INTO photo_tags (photo_id, tag) VALUES (?1, ?2)")?;
+            for &id in ids {
+                for tag in remove.iter().map(|t| t.trim()) {
+                    delete.execute(params![id, tag])?;
+                }
+                for tag in add.iter().map(|t| t.trim()).filter(|t| !t.is_empty()) {
+                    insert.execute(params![id, tag])?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The ratings and tags of `ids` (missing photos are left out).
+    pub fn selection(&self, ids: &[i64]) -> Result<Selection> {
+        let mut rating = self.conn.prepare_cached("SELECT rating FROM photos WHERE id = ?1")?;
+        let mut tags = self.conn.prepare_cached("SELECT tag FROM photo_tags WHERE photo_id = ?1")?;
+        let mut sel = Selection::default();
+        let mut counts: HashMap<String, u64> = HashMap::new();
+        for &id in ids {
+            let Some(r) = rating.query_row([id], |r| r.get::<_, Option<u8>>(0)).optional()? else { continue };
+            sel.photos += 1;
+            sel.ratings[usize::from(r.unwrap_or(0).min(5))] += 1;
+            for tag in tags.query_map([id], |r| r.get::<_, String>(0))? {
+                *counts.entry(tag?).or_default() += 1;
+            }
+        }
+        sel.tags = counts.into_iter().collect();
+        sel.tags.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase())));
+        Ok(sel)
     }
 
     /// Remembers folders the user added, so they can be rescanned together.
@@ -552,7 +613,7 @@ mod tests {
         let mut cat = Catalog::open_in_memory().unwrap();
         let [id] = cat.upsert_many(&[photo("/a.jpg", 100)]).unwrap()[..] else { panic!() };
         assert!(cat.set_rating(id, Some(4)).unwrap());
-        cat.edit_tags(id, &["family".into(), " beach ".into()], &[]).unwrap();
+        cat.edit_tags(&[id], &["family".into(), " beach ".into()], &[]).unwrap();
 
         let ids = cat.upsert_many(&[photo("/a.jpg", 200)]).unwrap();
         assert_eq!(ids, vec![id], "same path keeps its id");
@@ -570,7 +631,7 @@ mod tests {
         let fps = cat.fingerprints().unwrap();
         assert_eq!(fps["/b.jpg"], Fingerprint { id: ids[1], size: 100, mtime_ns: 1, meta_version: 1, hash: None });
 
-        cat.edit_tags(ids[0], &["x".into()], &[]).unwrap();
+        cat.edit_tags(&ids[..1], &["x".into()], &[]).unwrap();
         cat.remove_many(&ids[..1]).unwrap();
         assert_eq!(cat.count().unwrap(), 1);
         assert!(cat.get(ids[0]).unwrap().is_none());
@@ -615,9 +676,32 @@ mod tests {
 
     #[test]
     fn rejects_bad_rating() {
-        let cat = Catalog::open_in_memory().unwrap();
+        let mut cat = Catalog::open_in_memory().unwrap();
         assert!(matches!(cat.set_rating(1, Some(6)), Err(Error::BadRating(6))));
+        assert!(matches!(cat.set_ratings(&[1], Some(0)), Err(Error::BadRating(0))));
         assert!(!cat.set_rating(1, Some(3)).unwrap(), "missing photo");
+    }
+
+    #[test]
+    fn edits_several_photos_at_once() {
+        let mut cat = Catalog::open_in_memory().unwrap();
+        let ids = cat.upsert_many(&[photo("/a.jpg", 1), photo("/b.jpg", 2), photo("/c.jpg", 3)]).unwrap();
+        cat.set_ratings(&ids[..2], Some(4)).unwrap();
+        cat.edit_tags(&ids[..1], &["beach".into()], &[]).unwrap();
+        cat.edit_tags(&ids, &["Family".into()], &[]).unwrap();
+
+        let sel = cat.selection(&[ids[0], ids[1], ids[2], 999]).unwrap();
+        assert_eq!(sel.photos, 3, "a missing photo is left out");
+        assert_eq!(sel.ratings, [1, 0, 0, 0, 2, 0]);
+        assert_eq!(sel.common_rating(), None);
+        assert_eq!(sel.tags, vec![("Family".to_string(), 3), ("beach".to_string(), 1)]);
+
+        cat.set_ratings(&ids, None).unwrap();
+        cat.edit_tags(&ids, &[], &["beach".into()]).unwrap();
+        let sel = cat.selection(&ids).unwrap();
+        assert_eq!(sel.common_rating(), Some(None));
+        assert_eq!(sel.tags, vec![("Family".to_string(), 3)]);
+        assert_eq!(cat.get(ids[2]).unwrap().unwrap().rating, None);
     }
 
     #[test]

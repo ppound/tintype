@@ -391,6 +391,14 @@ fn print_response(response: &Response) {
             }
         }
         Response::Photo(p) => print_photo(p),
+        Response::Selection(s) => {
+            let ratings: Vec<String> =
+                (0..6).filter(|&i| s.ratings[i] > 0).map(|i| format!("{}: {}", i, s.ratings[i])).collect();
+            println!("{} photos; ratings {}", s.photos, ratings.join(", "));
+            for (tag, n) in &s.tags {
+                println!("{n:>7}  {tag}");
+            }
+        }
         Response::Reindexed { photos } => println!("indexed {photos} photos"),
         Response::Faces(r) => println!("{} photos analyzed, {} faces, {} to go", r.processed, r.faces, r.remaining),
         Response::Analyze(r) => println!("{} photos analyzed, {} to go", r.processed, r.remaining),

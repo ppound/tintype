@@ -250,7 +250,7 @@ mod tests {
 
         // Edits in Tintype are written out; b gets its first sidecar.
         cat.set_rating(ida, Some(2)).unwrap();
-        cat.edit_tags(idb, &["new".into()], &[]).unwrap();
+        cat.edit_tags(&[idb], &["new".into()], &[]).unwrap();
         let r = write_sidecars(&mut cat, &[ida, idb]).unwrap();
         assert_eq!(r.written, 2);
         assert_eq!(xmp::read_sidecar(&a).unwrap(), Some(sc(Some(2), &["Barn"], &["Grace"])));

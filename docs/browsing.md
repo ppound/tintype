@@ -15,7 +15,8 @@ found, and the people in it. **All metadata** lists every EXIF field.
 **Ctrl+click** photos to add them to the selection, or to take them out again;
 **Shift+click** selects every photo from the last one clicked to this one, and **Ctrl+A**
 selects all the results. The details panel then says how many are selected, and below
-that shows the last photo clicked. Ratings and tags still apply to that one photo.
+that shows the last photo clicked. You can rate and tag them all at once there: see
+[Ratings and tags](ratings-and-tags.md#several-photos-at-once).
 **Clear** or **Esc** goes back to one photo. A stack counts as the photo it shows.
 
 ## Show in folder, to upload

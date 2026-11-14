@@ -13,6 +13,19 @@ photo with it, and × to remove it from the photo. Tags are listed in the sideba
 
 In the [slideshow](browsing.md#slideshow), press **T** to tag the photo on screen.
 
+## Several photos at once
+
+[Select several photos](browsing.md#select-several-photos) and the top of the details
+panel edits them all:
+
+- Click a star, or press **1**–**5**, to give them all that rating (**0** clears). The
+  stars are filled when they all share a rating.
+- Their tags are listed with how many of the photos have each, as in "travel (12)". Click
+  a tag to add it to the rest, and × to remove it from all of them.
+- Type in **Add a tag to all…** and press **Enter**.
+
+A stack counts as the photo it shows, as when you rate one photo.
+
 ## Best photos first
 
 The sort menu's **Best photos first** puts your best photos on top:

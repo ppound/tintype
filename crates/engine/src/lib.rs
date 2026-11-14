@@ -23,7 +23,7 @@ use tintype_infer::{
 };
 use tintype_jobs::{ScanOptions, SyncMode};
 
-pub use tintype_catalog::{FaceGroup, FaceInfo, Person, PhotoRecord};
+pub use tintype_catalog::{FaceGroup, FaceInfo, Person, PhotoRecord, Selection};
 pub use tintype_codecs::{self as codecs, Rgba, ThumbCache, decode_preview};
 pub use tintype_index::{
     FACET_FIELDS, FacetCount, Hit, SearchResults, Sort, facet_filter, facet_path, facet_segments, split_smart,
@@ -129,6 +129,23 @@ pub enum Command {
         #[serde(default)]
         remove: Vec<String>,
     },
+    /// Set or clear the rating of several photos; replies with their [`Selection`].
+    RateMany {
+        photos: Vec<i64>,
+        rating: Option<u8>,
+    },
+    /// Add and remove tags on several photos; replies with their [`Selection`].
+    TagMany {
+        photos: Vec<i64>,
+        #[serde(default)]
+        add: Vec<String>,
+        #[serde(default)]
+        remove: Vec<String>,
+    },
+    /// The ratings and tags of several photos.
+    Selection {
+        photos: Vec<i64>,
+    },
     /// Embed up to `batch` photos for smart search (downloading the models
     /// first if needed). Repeat until `remaining` is 0, like `FindFaces`.
     Analyze {
@@ -217,6 +234,7 @@ pub enum Response {
         counts: Vec<FacetCount>,
     },
     Photo(Box<PhotoRecord>),
+    Selection(Selection),
     Reindexed {
         photos: u64,
     },
@@ -524,10 +542,33 @@ impl Engine {
             Command::Tag { photo, add, remove } => {
                 let id = self.resolve(&photo)?.id;
                 self.before_edit(&[id])?;
-                self.catalog.edit_tags(id, &add, &remove)?;
+                self.catalog.edit_tags(&[id], &add, &remove)?;
                 self.after_edit(&[id])?;
                 self.refresh(id)
             }
+            Command::RateMany { photos, rating } => {
+                self.before_edit(&photos)?;
+                self.catalog.set_ratings(&photos, rating)?;
+                self.taste = None;
+                self.after_edit(&photos)?;
+                let mut changed = photos.clone();
+                for &id in &photos {
+                    changed.extend(tintype_jobs::refresh_cover(&mut self.catalog, id)?);
+                }
+                if changed.len() > photos.len() {
+                    self.stack_places = None;
+                }
+                self.reindex_photos(changed)?;
+                Ok(Response::Selection(self.catalog.selection(&photos)?))
+            }
+            Command::TagMany { photos, add, remove } => {
+                self.before_edit(&photos)?;
+                self.catalog.edit_tags(&photos, &add, &remove)?;
+                self.after_edit(&photos)?;
+                self.reindex_photos(photos.clone())?;
+                Ok(Response::Selection(self.catalog.selection(&photos)?))
+            }
+            Command::Selection { photos } => Ok(Response::Selection(self.catalog.selection(&photos)?)),
             Command::Analyze { batch } => self.analyze(batch, events).map(Response::Analyze),
             Command::Reindex => Ok(Response::Reindexed { photos: self.reindex(events)? }),
             Command::Stats => Ok(Response::Stats(Stats {
@@ -1278,6 +1319,43 @@ mod tests {
         let on = Command::Settings { write_sidecars: Some(true), aesthetic: None };
         engine.execute(on, &mut |_| {}).unwrap();
         assert_eq!(tintype_meta::xmp::read_sidecar(&b).unwrap().unwrap().rating, Some(1));
+    }
+
+    #[test]
+    fn several_photos_are_edited_together() {
+        let photos = tempfile::tempdir().unwrap();
+        let names = ["a.jpg", "b.jpg", "c.jpg"];
+        for name in names {
+            JpegSpec::canon().write(&photos.path().join(name));
+        }
+        let lib = tempfile::tempdir().unwrap();
+        let mut engine = Engine::open(lib.path()).unwrap();
+        engine
+            .execute(Command::Scan { roots: vec![photos.path().into()], hash: false, kinds: None }, &mut |_| {})
+            .unwrap();
+        let ids: Vec<i64> =
+            names.iter().map(|n| engine.resolve(&PhotoRef::Path(photos.path().join(n))).unwrap().id).collect();
+
+        let rate = Command::RateMany { photos: ids[..2].to_vec(), rating: Some(3) };
+        let Response::Selection(sel) = engine.execute(rate, &mut |_| {}).unwrap() else { panic!() };
+        assert_eq!((sel.photos, sel.common_rating()), (2, Some(Some(3))));
+        let tag = Command::TagMany { photos: ids.clone(), add: vec!["trip".into()], remove: vec![] };
+        let Response::Selection(sel) = engine.execute(tag, &mut |_| {}).unwrap() else { panic!() };
+        assert_eq!(sel.tags, vec![("trip".to_string(), 3)]);
+        assert_eq!(sel.ratings, [1, 0, 0, 2, 0, 0]);
+
+        let mut found = hits(&mut engine, "tag:trip rating:3");
+        found.sort();
+        assert_eq!(found, ["a.jpg", "b.jpg"], "the index is up to date");
+        let sidecar = tintype_meta::xmp::read_sidecar(&photos.path().join("b.jpg")).unwrap().unwrap();
+        assert_eq!((sidecar.rating, sidecar.tags), (Some(3), vec!["trip".to_string()]));
+
+        let untag = Command::TagMany { photos: ids[1..].to_vec(), add: vec![], remove: vec!["trip".into()] };
+        engine.execute(untag, &mut |_| {}).unwrap();
+        let Response::Selection(sel) = engine.execute(Command::Selection { photos: ids }, &mut |_| {}).unwrap() else {
+            panic!()
+        };
+        assert_eq!(sel.tags, vec![("trip".to_string(), 1)]);
     }
 
     #[test]

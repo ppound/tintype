@@ -295,7 +295,7 @@ a screenshot and exits. `TINTYPE_SCREENSHOT_SELECT=<n>` selects a result first
 
 1. ~~Indexer + CLI~~
 2. ~~egui shell: thumbnail grid, single-photo view, facet sidebar, search~~
-   ~~RAF image size, DNG previews~~
+   ~~RAF image size, DNG previews~~, ~~rating and tagging several photos at once~~
    Next: HEIC and other RAW previews, paging for very large result sets
 3. ~~Faces: detect, group, name, suggest, merge~~
    Next: faster face passes, HEIC previews for detection, scaling grouping past ~20k faces

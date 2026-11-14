@@ -13,8 +13,8 @@ use eframe::egui::{
 };
 use serde::{Deserialize, Serialize};
 use tintype_engine::{
-    Command, Engine, Event, FacetCount, FileKind, Hit, PhotoRecord, PhotoRef, Response, ScanProgress, Sort, Stats,
-    facet_filter, facet_path, facet_segments, split_smart,
+    Command, Engine, Event, FacetCount, FileKind, Hit, PhotoRecord, PhotoRef, Response, ScanProgress, Selection, Sort,
+    Stats, facet_filter, facet_path, facet_segments, split_smart,
 };
 
 use crate::backend::{Backend, Job, Msg, Reply};
@@ -176,6 +176,14 @@ pub struct TintypeApp {
     picked: HashSet<i64>,
     /// Where a Shift+click range starts.
     anchor: Option<usize>,
+    /// Ratings and tags of the picked photos, for editing them together.
+    picked_summary: Option<Selection>,
+    /// The picked photos `picked_summary` was last asked for, and the reply awaited.
+    summary_for: HashSet<i64>,
+    summary_seq: u64,
+    /// The reply awaited is for an edit, so the details and tag counts need a refresh too.
+    summary_edit: bool,
+    picked_tag_input: String,
     gathering: Option<Gathering>,
     /// Notices from helper threads (showing a folder, copying photos).
     helper_notices: HelperNotices,
@@ -236,6 +244,11 @@ impl TintypeApp {
             selected: None,
             picked: HashSet::new(),
             anchor: None,
+            picked_summary: None,
+            summary_for: HashSet::new(),
+            summary_seq: 0,
+            summary_edit: false,
+            picked_tag_input: String::new(),
             gathering: None,
             helper_notices: crossbeam_channel::unbounded(),
             detail: None,
@@ -535,7 +548,12 @@ impl TintypeApp {
             (Job::Show, _) if seq != self.detail_seq => {}
             (Job::Show, Ok(Response::Photo(p))) => self.detail = Some(*p),
 
+            (Job::Selection, _) if seq != self.summary_seq => {}
+            (Job::Selection, Ok(Response::Selection(s))) => self.on_picked_summary(s),
+
             (Job::Edit, Ok(Response::Photo(p))) => {
+                // One of the picked photos may have changed: ask again for their summary.
+                self.summary_for.clear();
                 if self.detail.as_ref().is_some_and(|d| d.id == p.id) {
                     self.detail = Some(*p);
                 }
@@ -678,10 +696,13 @@ impl TintypeApp {
             self.hand_to_os(&path, print);
         }
         let digits = [Key::Num0, Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5];
-        if let Some(id) = self.selected.map(|i| self.results[i].id)
-            && let Some(n) = digits.iter().position(|&k| pressed(k))
-        {
-            self.rate(id, (n > 0).then_some(n as u8));
+        if let Some(n) = digits.iter().position(|&k| pressed(k)) {
+            let rating = (n > 0).then_some(n as u8);
+            if self.view == View::Grid && !self.picked.is_empty() {
+                self.rate_picked(rating);
+            } else if let Some(id) = self.selected.map(|i| self.results[i].id) {
+                self.rate(id, rating);
+            }
         }
     }
 
@@ -1041,24 +1062,7 @@ impl TintypeApp {
             }
 
             ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 2.0;
-                for n in 1..=5u8 {
-                    let (rect, resp) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::click());
-                    let filled = p.rating.is_some_and(|r| r >= n);
-                    let color = match (filled, resp.hovered()) {
-                        (true, _) => STAR,
-                        (false, true) => ui.visuals().text_color(),
-                        (false, false) => ui.visuals().weak_text_color(),
-                    };
-                    paint_star(ui.painter(), rect.center(), 10.0, filled, color);
-                    let hint =
-                        if p.rating == Some(n) { "Clear rating (0)".into() } else { format!("Rate {n} (key {n})") };
-                    if resp.on_hover_text(hint).clicked() {
-                        new_rating = Some(if p.rating == Some(n) { None } else { Some(n) });
-                    }
-                }
-            });
+            new_rating = star_row(ui, p.rating, |n| format!("Rate {n} (key {n})"));
             if p.rating.is_none()
                 && let Some(s) = p.suggested_rating
             {
@@ -1681,6 +1685,30 @@ fn facet_row(ui: &mut egui::Ui, label: &str, count: u64) -> egui::Response {
 
 /// A five-pointed star. Filled as a pentagon plus five point triangles,
 /// since egui fills only convex shapes.
+/// Five clickable stars showing `rating`. Returns the rating clicked: the
+/// current one again clears it (`Some(None)`).
+fn star_row(ui: &mut egui::Ui, rating: Option<u8>, hint: impl Fn(u8) -> String) -> Option<Option<u8>> {
+    let mut clicked = None;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        for n in 1..=5u8 {
+            let (rect, resp) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::click());
+            let filled = rating.is_some_and(|r| r >= n);
+            let color = match (filled, resp.hovered()) {
+                (true, _) => STAR,
+                (false, true) => ui.visuals().text_color(),
+                (false, false) => ui.visuals().weak_text_color(),
+            };
+            paint_star(ui.painter(), rect.center(), 10.0, filled, color);
+            let text = if rating == Some(n) { "Clear rating (0)".into() } else { hint(n) };
+            if resp.on_hover_text(text).clicked() {
+                clicked = Some(if rating == Some(n) { None } else { Some(n) });
+            }
+        }
+    });
+    clicked
+}
+
 fn paint_star(painter: &egui::Painter, center: egui::Pos2, radius: f32, filled: bool, color: Color32) {
     let point = |i: usize, r: f32| {
         let angle = std::f32::consts::PI * (i as f32 / 5.0) - std::f32::consts::FRAC_PI_2;

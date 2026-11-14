@@ -1,16 +1,17 @@
-//! Picking several photos (Ctrl+click, Shift+click, Ctrl+A) and showing them
-//! in the file manager, copied together into one folder when they're spread
-//! over several.
+//! Picking several photos (Ctrl+click, Shift+click, Ctrl+A), rating and
+//! tagging them together, and showing them in the file manager, copied
+//! together into one folder when they're spread over several.
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use eframe::egui::{self, Modifiers, RichText};
-use tintype_engine::Hit;
+use eframe::egui::{self, Key, Modifiers, RichText, TextEdit};
+use tintype_engine::{Command, Hit, PhotoRef, Selection};
 
-use super::{COMMAND, TintypeApp, thousands};
+use super::{COMMAND, TintypeApp, star_row, tag_chip, thousands};
+use crate::backend::Job;
 use crate::gather::{self, Progress};
 use crate::os;
 
@@ -89,6 +90,9 @@ impl TintypeApp {
     pub(super) fn clear_picked(&mut self) {
         self.picked.clear();
         self.anchor = self.selected;
+        self.picked_tag_input.clear();
+        self.picked_summary = None;
+        self.summary_for.clear();
     }
 
     /// After new results: keep the picked photos that are still shown.
@@ -127,11 +131,106 @@ impl TintypeApp {
                 self.clear_picked();
             }
         });
+        if self.summary_for != self.picked {
+            self.summary_for = self.picked.clone();
+            let photos = self.picked_ids();
+            self.summary_seq = self.backend.send(Job::Selection, Command::Selection { photos });
+            self.summary_edit = false;
+        }
+        if let Some(sel) = self.picked_summary.clone() {
+            self.picked_edits(ui, &sel);
+        }
         ui.weak(format!(
             "{COMMAND}+click adds or removes a photo, Shift+click a range, {COMMAND}+A selects all. \
              Below: the last photo clicked."
         ));
         ui.separator();
+    }
+
+    /// Rating and tags for all the picked photos at once.
+    fn picked_edits(&mut self, ui: &mut egui::Ui, sel: &Selection) {
+        let n = thousands(sel.photos);
+        ui.add_space(4.0);
+        let common = sel.common_rating();
+        let rating = star_row(ui, common.flatten(), |r| format!("Rate all {n} photos {r} (key {r})"));
+        if common.is_none() {
+            let unrated = sel.ratings[0];
+            ui.weak(if unrated == 0 {
+                "Their ratings differ.".to_string()
+            } else {
+                format!("Their ratings differ; {} unrated.", thousands(unrated))
+            });
+        }
+        let mut add = None;
+        let mut remove = None;
+        if !sel.tags.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                for (tag, count) in &sel.tags {
+                    let all = *count == sel.photos;
+                    let label = if all { tag.clone() } else { format!("{tag} ({})", thousands(*count)) };
+                    let (name, close) = tag_chip(ui, &label);
+                    let hint = if all {
+                        format!("On all {n} photos")
+                    } else {
+                        format!("On {} of {n} photos. Click to add it to the rest.", thousands(*count))
+                    };
+                    if name.on_hover_text(hint).clicked() && !all {
+                        add = Some(tag.clone());
+                    }
+                    if close.on_hover_text(format!("Remove from all {n} photos")).clicked() {
+                        remove = Some(tag.clone());
+                    }
+                }
+            });
+        }
+        let edit = ui.add(
+            TextEdit::singleline(&mut self.picked_tag_input)
+                .hint_text(format!("Add a tag to all {n}…"))
+                .desired_width(f32::INFINITY),
+        );
+        if edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) && !self.picked_tag_input.trim().is_empty() {
+            add = Some(std::mem::take(&mut self.picked_tag_input));
+            edit.request_focus();
+        }
+        if let Some(r) = rating {
+            self.rate_picked(r);
+        }
+        if add.is_some() || remove.is_some() {
+            let photos = self.picked_ids();
+            let cmd = Command::TagMany { photos, add: add.into_iter().collect(), remove: remove.into_iter().collect() };
+            self.summary_seq = self.backend.send(Job::Selection, cmd);
+            self.summary_edit = true;
+        }
+    }
+
+    pub(super) fn rate_picked(&mut self, rating: Option<u8>) {
+        let photos = self.picked_ids();
+        let n = thousands(photos.len() as u64);
+        self.notify(
+            match rating {
+                Some(r) => format!("Rated {n} photos {r} {}", if r == 1 { "star" } else { "stars" }),
+                None => format!("Cleared the rating of {n} photos"),
+            },
+            false,
+        );
+        self.summary_seq = self.backend.send(Job::Selection, Command::RateMany { photos, rating });
+        self.summary_edit = true;
+    }
+
+    /// The picked photos' ratings and tags, fresh or just edited.
+    pub(super) fn on_picked_summary(&mut self, sel: Selection) {
+        self.picked_summary = Some(sel);
+        if std::mem::take(&mut self.summary_edit) {
+            self.request_facet("tags");
+            // The details below show one of the picked photos.
+            if let Some(id) = self.selected.filter(|&i| self.is_picked(i)).map(|i| self.results[i].id) {
+                self.detail_seq = self.backend.send(Job::Show, Command::Show { photo: PhotoRef::Id(id) });
+            }
+        }
+    }
+
+    fn picked_ids(&self) -> Vec<i64> {
+        self.picked_hits().iter().map(|h| h.id).collect()
     }
 
     /// The files to show for the picked photos (the cover of a stack: the JPG of a RAF+JPG pair).

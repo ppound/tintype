@@ -17,6 +17,8 @@ pub enum Job {
     Facets(&'static str),
     Show,
     Edit,
+    /// The ratings and tags of the picked photos, or an edit of them all.
+    Selection,
     Scan,
     Stats,
     People,
