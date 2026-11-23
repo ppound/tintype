@@ -118,7 +118,8 @@ pub struct ScreenshotPlan {
     /// Or select the first result whose path contains this text.
     pub select_name: Option<String>,
     /// "loupe", "slideshow" (or "slideshow-keys", "slideshow-tags"), "stack", "similar" (photos like the
-    /// selected one), "picked" (several photos picked), "people" or "person" (the first person's page).
+    /// selected one), "picked" (several photos picked), "people" or "person" (the first person's page),
+    /// "about" (the menu under the app name).
     pub view: Option<String>,
     /// Run this smart search first (an empty string shows smart mode with no query).
     pub smart_query: Option<String>,
@@ -711,7 +712,11 @@ impl TintypeApp {
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Tintype").strong().size(18.0));
+            let about = ui.menu_button(RichText::new("Tintype").strong().size(18.0), |ui| self.about_menu(ui)).response;
+            if self.screenshot.as_ref().is_some_and(|s| s.plan.view.as_deref() == Some("about")) {
+                egui::Popup::open_id(ui.ctx(), egui::Popup::default_response_id(&about));
+            }
+            about.on_hover_text("Version, library folder and help");
             ui.add_space(12.0);
             for (tab, label) in [(Tab::Photos, "Photos"), (Tab::People, "People")] {
                 if ui.selectable_label(self.tab == tab, RichText::new(label).size(15.0)).clicked() && self.tab != tab {
@@ -859,6 +864,39 @@ impl TintypeApp {
             }
         }
         ui.add_space(4.0);
+    }
+
+    /// What the app name opens: the version, the library folder and links to help.
+    fn about_menu(&mut self, ui: &mut egui::Ui) {
+        const REPO: &str = env!("CARGO_PKG_REPOSITORY");
+        const VERSION: &str = env!("CARGO_PKG_VERSION");
+        ui.set_min_width(260.0);
+        ui.set_max_width(340.0);
+        ui.label(RichText::new(format!("Tintype {VERSION}")).strong().size(16.0));
+        ui.weak("Index, search and tag your photo library.");
+        ui.separator();
+        if let Some(stats) = &self.stats {
+            let library = stats.library.clone();
+            ui.weak("Library");
+            ui.add(egui::Label::new(&library).wrap());
+            if ui
+                .button("Open library folder")
+                .on_hover_text("Where Tintype keeps its catalog and thumbnails")
+                .clicked()
+            {
+                ui.close();
+                if let Err(e) = os::open(Path::new(&library)) {
+                    self.notify(format!("Could not open the library folder: {e}"), true);
+                }
+            }
+            ui.separator();
+        }
+        ui.hyperlink_to("User guide", format!("{REPO}/blob/main/docs/README.md"));
+        ui.hyperlink_to(format!("What's new in {VERSION}"), format!("{REPO}/releases/tag/v{VERSION}"));
+        ui.hyperlink_to("Report a problem", format!("{REPO}/issues"));
+        ui.hyperlink_to("Source code", REPO);
+        ui.separator();
+        ui.weak(concat!("Licensed ", env!("CARGO_PKG_LICENSE")));
     }
 
     /// Rescan and Add folder, right-aligned in the top bar.

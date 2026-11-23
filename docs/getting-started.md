@@ -71,5 +71,9 @@ The catalog, search index and thumbnail cache live in your user data folder
 files Tintype writes next to them are [sidecars](ratings-and-tags.md#sidecars), and you
 can turn those off.
 
+Click **Tintype** at the top left to see which version you have, where your library folder
+is (with a button to open it), and links to this guide, the release notes and the issue
+tracker.
+
 If Tintype ever crashes, details are written to `crash.log` in the library folder.
 Please [open an issue](https://github.com/ppound/tintype/issues) with it.
